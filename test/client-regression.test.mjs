@@ -331,7 +331,7 @@ check("stats line caps at two rows with ellipsis style",
   const h = d.getUTCHours();
   const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
   const outP = peak ? 9.0 : 4.5;
-  const expected = "本轮 ¥" + (100000 * outP / 1e6).toFixed(2);
+  const expected = "本轮 ¥" + (100000 * outP / 1e6).toFixed(4);
   check("本轮 counts only the new usage (100000 output tokens)", t1.indexOf(expected) !== -1, t1 + " expected " + expected);
   // same usage again → no change (no phantom from re-pricing)
   const t2 = textOf(render(env, props));
@@ -508,7 +508,7 @@ const HOST_TABLES = {
   // {"a": (5) + 1} (2) = 7 chars, shared output density 2.5
   const est1 = (4000 / 3.5 + 7 / 2.5) * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
-  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(2)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(2));
+  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(4)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(4));
   // popover: one total with the breakdown in parens, full 6-decimal detail
   const pop1 = popTextOf(render(env, runningProps));
   check("popover shows total with (精确 + 估算) breakdown",
@@ -518,7 +518,7 @@ const HOST_TABLES = {
   events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
   const est2 = (4000 / 3.5 + 7 / 2.5 + 4000 / 2.5) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
-  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(2)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(2));
+  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(4));
   // usage chunk lands → estimate resets; the turn fold shows the EXACT step
   // cost (no (估) marker). The assistant/message (which carries the model)
   // follows in the real stream and corrects the fold's price.
@@ -792,8 +792,8 @@ const HOST_TABLES = {
   const step1 = (100 * missP + 500 * readP + 4200 * outP) / 1e6;
   const t = groupTextsOf(render(env, runningProps));
   check("first-step exact fold is priced (精确 not stuck at 0)",
-    Math.abs(cnyOf(t) - step1) < 0.0051 && t.indexOf("本轮 ¥" + step1.toFixed(2)) !== -1,
-    t + " expected " + step1.toFixed(2));
+    Math.abs(cnyOf(t) - step1) < 0.0051 && t.indexOf("本轮 ¥" + step1.toFixed(4)) !== -1,
+    t + " expected " + step1.toFixed(4));
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
