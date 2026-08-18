@@ -1,7 +1,7 @@
 {
   "name": "dsh-better-stats",
   "version": "0.1.0",
-  "description": "Better session stats strip: cost this turn / total cost / provider balance, styled like the shipped stats row, with ellipsis-truncation fixed",
+  "description": "Enhanced DSH composer stats strip: official CNY cost (peak/off-peak, per-model), real-time settlement, live LLM/tool timers, provider balance, subagent tree merge",
   "license": "MIT",
   "type": "module",
   "exports": {
@@ -9,7 +9,27 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hanshushao123/dsh-better-stats.git"
+  },
+  "keywords": [
+    "dsh",
+    "plugin",
+    "stats",
+    "cost",
+    "balance",
+    "deepseek"
+  ],
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }

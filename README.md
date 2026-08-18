@@ -17,27 +17,31 @@ DeepSeek 官方 | 余额 ¥8.67 | 本轮 ¥0.1676 · 会话 ¥29.49 | 20 轮 · 
 
 ## 安装（其他机器 / 其他端）
 
-前置：已安装 DSH Web profile（`~/.dsh/profiles/web`），有 `DEEPSEEK_API_KEY` 可用。
+### 方式一：npm（推荐，一条命令装完）
 
 ```bash
-# 1. 克隆
+# 1. 在 profile 目录安装包（等价于 dsh plugin --profile web add dsh-better-stats）
+cd ~/.dsh/profiles/web
+pnpm add dsh-better-stats
+
+# 2. 把它登记为 bundle（让包内 cordis.patch.yml 自动注册 better-stats 行）：
+#    package.json 的 dsh.profile.bundles 数组里加一行 "dsh-better-stats"
+
+# 3. 重启 dsh web，硬刷新浏览器
+```
+
+包内自带 `cordis.patch.yml`（`dsh.bundle.patch`），登记为 bundle 后**无需手改任何配置**。
+
+### 方式二：GitHub 克隆
+
+```bash
 git clone https://github.com/hanshushao123/dsh-better-stats.git
 cd dsh-better-stats          # 无运行时依赖，不需要 npm install
 
-# 2. 放进 profile 的 node_modules（符号链接即可）
 ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-better-stats
-
-# 3. profile package.json 登记依赖（dependencies 里加一行）
-#    "dsh-better-stats": "link:/绝对路径/dsh-better-stats",
-
-# 4. profile cordis.patch.yml 的 insert 块里加插件行（若还没有）
-#    - id: better-stats
-#      name: dsh-better-stats
-
-# 5. 重启 dsh web，硬刷新浏览器
+# profile package.json 加依赖: "dsh-better-stats": "link:/绝对路径/dsh-better-stats",
+# 再按方式一的第 2、3 步登记 bundle 并重启
 ```
-
-> 或者用 pnpm：在 profile 目录 `pnpm add dsh-better-stats@link:/绝对路径/dsh-better-stats`。
 
 ## 架构
 

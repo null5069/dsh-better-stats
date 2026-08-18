@@ -1,0 +1,6 @@
+# dsh-better-stats bundle patch: registers the stats-strip plugin row.
+# Applied automatically when this package is listed in the profile's
+# dsh.profile.bundles (see README install steps).
+- insert:
+    - id: better-stats
+      name: dsh-better-stats
