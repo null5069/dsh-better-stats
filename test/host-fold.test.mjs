@@ -33,7 +33,7 @@ function priceBuckets(b, time, model) {
   return ((b.uncachedInputTokens + b.cacheWriteTokens) * miss + b.cacheReadTokens * read + b.outputTokens * out) / 1e6;
 }
 function foldUsage(events) {
-  const totals = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+  const totals = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
   const samples = new Map();
   for (const e of events) {
     if (e === void 0 || typeof e !== "object" || e === null) continue;
@@ -48,6 +48,7 @@ function foldUsage(events) {
     const buckets = {
       uncachedInputTokens: Number(usage.inputTokens) || 0,
       outputTokens: Number(usage.outputTokens) || 0,
+      reasoningTokens: Number(usage.reasoningTokens) || 0,
       cacheReadTokens: Number(usage.cacheReadTokens) || 0,
       cacheWriteTokens: Number(usage.cacheWriteTokens) || 0
     };
@@ -58,12 +59,14 @@ function foldUsage(events) {
   for (const sample of samples.values()) {
     totals.uncachedInputTokens += sample.buckets.uncachedInputTokens;
     totals.outputTokens += sample.buckets.outputTokens;
+    totals.reasoningTokens += sample.buckets.reasoningTokens;
     totals.cacheReadTokens += sample.buckets.cacheReadTokens;
     totals.cacheWriteTokens += sample.buckets.cacheWriteTokens;
     const key = modelKeyOf(sample.model);
-    const entry = byModel.get(key) ?? { usage: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }, costCny: 0 };
+    const entry = byModel.get(key) ?? { usage: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 }, costCny: 0 };
     entry.usage.uncachedInputTokens += sample.buckets.uncachedInputTokens;
     entry.usage.outputTokens += sample.buckets.outputTokens;
+    entry.usage.reasoningTokens += sample.buckets.reasoningTokens;
     entry.usage.cacheReadTokens += sample.buckets.cacheReadTokens;
     entry.usage.cacheWriteTokens += sample.buckets.cacheWriteTokens;
     entry.costCny += priceBuckets(sample.buckets, sample.time, sample.model);
@@ -106,14 +109,16 @@ for (const [id, s] of Object.entries(sessions)) {
     byStep.set(`${turn}:${step}`, {
       uncachedInputTokens: Number(usage.inputTokens) || 0,
       outputTokens: Number(usage.outputTokens) || 0,
+      reasoningTokens: Number(usage.reasoningTokens) || 0,
       cacheReadTokens: Number(usage.cacheReadTokens) || 0,
       cacheWriteTokens: Number(usage.cacheWriteTokens) || 0
     });
   }
-  const expected = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 };
+  const expected = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
   for (const b of byStep.values()) {
     expected.uncachedInputTokens += b.uncachedInputTokens;
     expected.outputTokens += b.outputTokens;
+    expected.reasoningTokens += b.reasoningTokens;
     expected.cacheReadTokens += b.cacheReadTokens;
     expected.cacheWriteTokens += b.cacheWriteTokens;
   }
@@ -288,6 +293,13 @@ const KNOWN_FOLD = realFoldUsage([
   { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
 ]);
 check("known model has zero unpriced steps", KNOWN_FOLD.unpricedSteps === 0 && KNOWN_FOLD.costCny === 0.00605, JSON.stringify(KNOWN_FOLD));
+const REASON_FOLD = realFoldUsage([
+  { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 0, outputTokens: 1000, cacheReadTokens: 0, reasoningTokens: 2000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+]);
+check("reasoning tokens billed at the output rate",
+  REASON_FOLD.totals.reasoningTokens === 2000 && REASON_FOLD.totals.outputTokens === 1000 &&
+  Math.abs(REASON_FOLD.costCny - (1000 + 2000) * 4.5 / 1e6) < 1e-12,
+  JSON.stringify({ totals: REASON_FOLD.totals, costCny: REASON_FOLD.costCny }));
 
 // ── v20 P1-3: sinceMs filter (the "today" fold core) ──────────────────────
 const TODAY_SINCE = Date.UTC(2026, 7, 17, 16, 0); // 2026-08-18 00:00 Beijing

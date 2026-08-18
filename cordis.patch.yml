@@ -2,12 +2,17 @@
 # Applied automatically when this package is listed in the profile's
 # dsh.profile.bundles (see README install steps).
 #
-# config (all optional):
-#   dailyBudgetCny / monthlyBudgetCny — budget alerts (client marks the 花费
-#   group amber at 80%, red with ⚠ over budget; hover shows 今日/本月 totals).
+# config — ALL OPTIONAL:
+#   balanceWarnCny / balanceCriticalCny — 余额两档告警：余额 ≤ warn 时余额组
+#                     变琥珀 ⚠，≤ critical 时变红 ⚠。默认 20 / 5；设 0 关闭
+#                     对应档。
+#   dailyBudgetCny / monthlyBudgetCny — 日/月预算告警（花费组 ≥80% 琥珀、
+#                     超支红 ⚠，悬浮显示今日/本月合计）。默认不启用；
+#                     配置即启用（例：dailyBudgetCny: 20）。
+# 不写 config 块 = 全部默认（余额告警 20/5 两档，无预算告警）。
 - insert:
     - id: better-stats
       name: dsh-better-stats
       config:
-        dailyBudgetCny: 20
-        monthlyBudgetCny: 100
+        balanceWarnCny: 20
+        balanceCriticalCny: 5

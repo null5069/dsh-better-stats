@@ -156,7 +156,12 @@ const propsNoData = {
 {
   const env = makeEnv();
   const el = render(env, propsNoData);
-  check("no-data renders placeholder v20-empty", !!(el && el.props && el.props["data-bs"] === "v20-empty"), JSON.stringify(el).slice(0, 140));
+  const flat0 = (el.children || []).flat(Infinity).filter(Boolean);
+  const texts0 = flat0.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
+    .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
+  check("no-data still renders the line with the 峰谷 group",
+    !!(el && el.props && el.props["data-bs"] === "v20") && texts0.indexOf("峰谷") === -1 && /^(高峰中|空闲中)$/.test(texts0),
+    JSON.stringify(el).slice(0, 140) + " texts=" + texts0);
 }
 
 // Scenario 2: data present, no balance yet → full line with groups
@@ -252,12 +257,12 @@ const propsNoData = {
   // separator begins a new row, while the following two fit that row.
   lineRef.current = { clientWidth: 300 };
   probeRef.current = { offsetWidth: 20 };
-  [80, 90, 70, 60, 50, 40].forEach((width, i) => {
+  [80, 90, 70, 60, 50, 40, 30].forEach((width, i) => {
     itemRef.current[i] = { offsetWidth: width, idx: i };
   });
   measure();
   check("width simulation hides only the row-boundary separator",
-    JSON.stringify(hidden()) === "[false,false,true,false,false]",
+    JSON.stringify(hidden()) === "[false,false,true,false,false,false]",
     JSON.stringify(hidden()));
 
   // Same geometry produces the same array object — no state feedback loop.
@@ -267,7 +272,7 @@ const propsNoData = {
 
   lineRef.current.clientWidth = 1000;
   measure();
-  check("re-flow restores separators", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
+  check("re-flow restores separators", JSON.stringify(hidden()) === "[false,false,false,false,false,false]", JSON.stringify(hidden()));
 }
 
 // Scenario 9: ref-index capture — every group keeps its own natural-width ref,
@@ -297,12 +302,14 @@ const propsNoData = {
   const measure = env.states[9].current;
   const hidden = () => env.states[5].value;
   measure();
-  check("natural-width measure keeps same-line separators", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
+  check("natural-width measure keeps same-line separators", JSON.stringify(hidden()) === "[false,false,false,false,false,false]", JSON.stringify(hidden()));
 }
 
-// Scenario 10: wrapping is never clipped to two rows.
-check("stats line no longer clips wrapped rows",
-  code.includes("max-height:none;overflow:visible") && !code.includes("max-height:44px;overflow:hidden"));
+// Scenario 10: the strip caps at two rows with an ellipsis marker on the
+// second row (user spec: 最多两行，溢出时第二行末尾省略号).
+check("stats line caps at two rows with ellipsis style",
+  code.includes("max-height:48px;overflow:hidden") && code.includes("dsh-better-stats-ellipsis") &&
+  !code.includes("max-height:none;overflow:visible"));
 
 // Scenario 12: 本轮 prices ONLY the new usage — no retroactive re-pricing
 {
@@ -341,6 +348,11 @@ function groupTextsOf(el) {
 // comparisons — addition order differs between client and test)
 function cnyOf(text) {
   const m = String(text).match(/本轮 ¥([\d.]+)/);
+  return m ? Number(m[1]) : NaN;
+}
+// parse the in-flight estimate from the popover 本轮 line "（精确 A + 估算 B）"
+function estimateCnyOf(text) {
+  const m = String(text).match(/估算 ¥([\d.]+)/);
   return m ? Number(m[1]) : NaN;
 }
 // flat() does not descend into element .children properties — collect strings
@@ -439,7 +451,7 @@ const HOST_TABLES = {
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
   check("balance split shown in hover", pop.indexOf("余额 ¥8.6700（赠送 ¥3.2000 · 充值 ¥5.4700）") !== -1, pop);
-  check("peak countdown line in hover", /(高峰进行中|空闲) · (高峰|空闲) \d{2}:00 开始（.+后）/.test(pop), pop);
+  check("peak countdown line in hover", /(高峰中|空闲中).*?(高峰|空闲) \d{2}:00 开始（.+后）/.test(pop), pop);
 }
 
 // Scenario 16: official price-source label (P0-1) — host pricing payload.
@@ -458,7 +470,8 @@ const HOST_TABLES = {
   env.states[3] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
-  check("official price source shown", /价格源：官方 \d{2}:\d{2} 更新/.test(pop), pop);
+  check("价源 row with YYYY-MM-DD HH:MM", /价源 DeepSeek 官方 \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(pop), pop);
+  check("价源 row directly under the 花费 group", pop.indexOf("会话 ¥") !== -1 && pop.indexOf("价源") > pop.indexOf("会话 ¥"), pop);
 }
 
 // Scenario 17: streaming estimate — batch events (reasoning-chunks /
@@ -485,19 +498,27 @@ const HOST_TABLES = {
     ...propsWithData,
     useSessions: () => ({ byId: { "session-test": { running: true } } })
   };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
   const d = new Date(Date.now() + 8 * 3600 * 1000);
   const h = d.getUTCHours();
   const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
   const outP = peak ? 9.0 : 4.5;
-  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args 6 chars / 1.6 = 3.75
-  const est1 = (4000 / 3.5 + 6 / 1.6) * outP / 1e6;
+  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args 6 chars
+  // share the output density 2.5 (text + tool JSON)
+  const est1 = (4000 / 3.5 + 6 / 2.5) * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
-  check("streaming estimate from batch events with (估) mark", t1.indexOf("本轮 ¥" + est1.toFixed(4) + "(估)") !== -1, t1 + " expected " + est1.toFixed(4));
-  // stream grows (in-place push) → estimate grows (text-chunks at /4)
+  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(4)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(4));
+  // popover: one total with the breakdown in parens (总（精确 + 估算）)
+  const pop1 = popTextOf(render(env, runningProps));
+  check("popover shows total with (精确 + 估算) breakdown",
+    pop1.indexOf("本轮 ¥" + est1.toFixed(4) + "（精确 ¥0.0000 + 估算 ¥" + est1.toFixed(4) + "）") !== -1,
+    pop1);
+  // stream grows (in-place push) → estimate grows (text-chunks share 2.5)
   events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
-  const est2 = (4000 / 3.5 + 6 / 1.6 + 4000 / 4) * outP / 1e6;
+  const est2 = (4000 / 3.5 + 6 / 2.5 + 4000 / 2.5) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
-  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4) + "(估)") !== -1, t2 + " expected " + est2.toFixed(4));
+  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(4));
   // usage chunk lands → estimate resets; the turn fold shows the EXACT step
   // cost (no (估) marker). The assistant/message (which carries the model)
   // follows in the real stream and corrects the fold's price.
@@ -506,6 +527,11 @@ const HOST_TABLES = {
   const step1Exact = (100 * (peak ? 3.0 : 1.5) + 5000 * (peak ? 0.1 : 0.05) + 8000 * outP) / 1e6;
   const t3 = groupTextsOf(render(env, runningProps));
   check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 1e-4, t3 + " expected " + step1Exact.toFixed(4));
+  // popover while RUNNING: the bracket persists even with a zero estimate
+  const pop3 = popTextOf(render(env, runningProps));
+  check("running keeps the 本轮 bracket (估算 ¥0.0000, no flicker)",
+    pop3.indexOf("本轮 ¥" + step1Exact.toFixed(4) + "（精确 ¥" + step1Exact.toFixed(4) + " + 估算 ¥0.0000）") !== -1,
+    pop3);
   // next step starts → base stays (turn fold) + carried input cost + new
   // reasoning estimate (100×miss + 5000×read at the current tier)
   events.push({ type: "step/end", data: { turn: 1, step: 1 } });
@@ -520,7 +546,14 @@ const HOST_TABLES = {
   const inputCny = (100 * missP + 5000 * readP) / 1e6;
   const est4 = step1Exact + inputCny + 700 / 3.5 * outP2 / 1e6;
   const t4 = groupTextsOf(render(env, runningProps));
-  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") !== -1 && Math.abs(cnyOf(t4) - est4) < 1e-4, t4 + " expected " + est4.toFixed(4));
+  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") === -1 && Math.abs(cnyOf(t4) - est4) < 1e-4, t4 + " expected " + est4.toFixed(4));
+  // 会话 ticks live as ONE number (历史+本轮), no breakdown bracket
+  const sessEst = inputCny + 200 * outP2 / 1e6;
+  const sessShown = 0.05 + sessEst;
+  const pop4 = popTextOf(render(env, runningProps));
+  check("live 会话 as one number without breakdown bracket",
+    pop4.indexOf("会话 ¥" + sessShown.toFixed(4)) !== -1 && pop4.indexOf("历史 ") === -1,
+    pop4);
 }
 
 // Scenario 18: 本轮 is TURN-scoped — the fold restarts at turn/start and
@@ -559,16 +592,19 @@ const HOST_TABLES = {
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const turn1Shown = step1 + inputCarry + 200 * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
-  check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") !== -1 && Math.abs(cnyOf(t1) - turn1Shown) < 1e-4, t1 + " expected " + turn1Shown.toFixed(4));
-  // turn 1 completes, turn 2 starts with fresh reasoning → base resets
+  check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") === -1 && Math.abs(cnyOf(t1) - turn1Shown) < 1e-4, t1 + " expected " + turn1Shown.toFixed(4));
+  // turn 1 completes → 本轮 KEEPS the final turn cost on display
   events.push({ type: "step/end", data: { turn: 1, step: 2 } });
   events.push({ type: "turn/end", data: { turn: 1 } });
+  const tEnd = groupTextsOf(render(env, runningProps));
+  check("turn/end keeps the final turn cost (no reset to 0)", Math.abs(cnyOf(tEnd) - step1) < 1e-4 && tEnd.indexOf("(估)") === -1, tEnd + " expected " + step1.toFixed(4));
+  // next turn starts → base resets; only estimate + carried input remain
   events.push({ type: "turn/start", data: { turn: 2 } });
   events.push({ type: "step/start", data: { turn: 2, step: 1 } });
   events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["c".repeat(700)] } });
   const turn2Shown = inputCarry + 200 * outP / 1e6; // fold reset; only estimate + carried input
   const t2 = groupTextsOf(render(env, runningProps));
-  check("turn/end resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") !== -1 && Math.abs(cnyOf(t2) - turn2Shown) < 1e-4, t2 + " expected " + turn2Shown.toFixed(4));
+  check("turn/start resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") === -1 && Math.abs(cnyOf(t2) - turn2Shown) < 1e-4, t2 + " expected " + turn2Shown.toFixed(4));
   // restored-session history (pre-loaded events without a turn/start) never
   // leaks into 本轮 before the first turn boundary
   const histEvents = [
@@ -581,6 +617,183 @@ const HOST_TABLES = {
   envH.states[17] = env.states[17];
   const tH = groupTextsOf(render(envH, runningProps));
   check("pre-loaded history stays out of 本轮 (fold starts at turn/start)", /本轮 ¥0\.0000/.test(tH) && tH.indexOf("(估)") === -1, tH);
+}
+
+// Scenario 19: two-tier low-balance alert — amber ≤ warn (default ¥20),
+// red ≤ critical (default ¥5), disabled with 0.
+{
+  const liveWith = (budget) => ({
+    value: {
+      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null,
+      budget: budget
+    }
+  });
+  const renderWith = (amount, budget) => {
+    applyWith({});
+    const env = makeEnv();
+    env.states[1] = { value: { text: "DeepSeek 官方 ¥" + amount, label: "DeepSeek 官方", amount, currency: "CNY", granted: null, toppedUp: null } };
+    env.states[17] = liveWith(budget);
+    env.states[2] = { value: true };
+    env.states[3] = { value: { left: 100, top: 100 } };
+    return render(env, propsWithData);
+  };
+  const balSpanOf = (el) => {
+    const flat = (el.children || []).flat(Infinity).filter(Boolean);
+    return flat.find((c) => c && c.props && typeof c.props.className === "string" &&
+      c.props.className.indexOf("item") !== -1 && String((c.children || []).join ? (c.children || []).join("") : "").indexOf("余额") !== -1);
+  };
+  const defaults = { balanceWarnCny: 20, balanceCriticalCny: 5 };
+
+  // 8.67 ≤ 20 → amber warn
+  const elWarn = renderWith(8.67, defaults);
+  const warnSpan = balSpanOf(elWarn);
+  const warnText = (warnSpan && warnSpan.children || []).join("");
+  check("balance ≤ warn → amber ⚠", /^⚠ /.test(warnText) && warnSpan.props.style.color === "#f59e0b", warnText + " " + JSON.stringify(warnSpan && warnSpan.props.style));
+  check("amber alert line in hover", popTextOf(elWarn).indexOf("余额告警：低于 ¥20.0000（琥珀）") !== -1, popTextOf(elWarn));
+
+  // 4 ≤ 5 → red critical
+  const elCrit = renderWith(4, defaults);
+  const critSpan = balSpanOf(elCrit);
+  const critText = (critSpan && critSpan.children || []).join("");
+  check("balance ≤ critical → red ⚠", /^⚠ /.test(critText) && critSpan.props.style.color === "#ef4444", critText + " " + JSON.stringify(critSpan && critSpan.props.style));
+  check("red alert line in hover", popTextOf(elCrit).indexOf("余额告警：低于 ¥5.0000（红色）") !== -1, popTextOf(elCrit));
+
+  // 25 > 20 → no alert
+  const elOk = renderWith(25, defaults);
+  const okText = (balSpanOf(elOk) && balSpanOf(elOk).children || []).join("");
+  check("balance above warn → no alert", !/^⚠ /.test(okText), okText);
+
+  // both tiers disabled with 0
+  const elOff = renderWith(4, { balanceWarnCny: 0, balanceCriticalCny: 0 });
+  const offText = (balSpanOf(elOff) && balSpanOf(elOff).children || []).join("");
+  check("alerts disabled with 0", !/^⚠ /.test(offText), offText);
+}
+
+// Scenario 20: streaming densities self-calibrate from settled steps (EMA) —
+// after a step settles with a real chars→tokens ratio, the next estimate
+// uses the adapted density instead of the fixed starting value.
+{
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    { type: "step/start", data: { turn: 1, step: 1 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["q".repeat(7000)] } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 0, cacheReadTokens: 500, reasoningTokens: 1000 } } } },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 0, cacheReadTokens: 500, reasoningTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "step/end", data: { turn: 1, step: 1 } },
+    { type: "step/start", data: { turn: 1, step: 2 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["r".repeat(700)] } }
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
+    }
+  };
+  const runningProps = {
+    ...propsWithData,
+    useSessions: () => ({ byId: { "session-test": { running: true } } })
+  };
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const hp = now.getUTCHours();
+  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
+  const missP = pk ? 3.0 : 1.5;
+  const readP = pk ? 0.1 : 0.05;
+  const outP = pk ? 9.0 : 4.5;
+  // EMA: density = 0.7*3.5 + 0.3*(7000/1000) = 4.55; step 2 = 700 chars / 4.55
+  const adaptedDensity = 0.7 * 3.5 + 0.3 * (7000 / 1000);
+  // step 1 settled with 1000 reasoning tokens — billed at the output rate
+  const step1Exact = (100 * missP + 500 * readP + 1000 * outP) / 1e6;
+  const inputCarry = (100 * missP + 500 * readP) / 1e6;
+  const expected = step1Exact + inputCarry + 700 / adaptedDensity * outP / 1e6;
+  const t = groupTextsOf(render(env, runningProps));
+  check("densities adapt after a settled step (EMA)", t.indexOf("(估)") === -1 && Math.abs(cnyOf(t) - expected) < 1e-4, t + " expected " + expected.toFixed(4));
+}
+
+// Scenario 21: two-row layout with MID-ellipsis — when the natural-width
+// model needs more than two rows, only the first row and the last row are
+// rendered, joined by a "⋯" marker (latex \cdots style); the middle groups
+// are hidden. The decision uses cached natural widths, so it is stable.
+{
+  applyWith({});
+  const env = makeEnv();
+  render(env, propsWithData);
+  const lineRef = env.states[4];
+  const itemRef = env.states[7];
+  const probeRef = env.states[8];
+  const measure = env.states[9].current;
+  // 7 groups × 60px + 20px separators in a 120px line → 7 rows
+  lineRef.current = { clientWidth: 120 };
+  probeRef.current = { offsetWidth: 20 };
+  for (let i = 0; i < 7; i++) itemRef.current[i] = { offsetWidth: 60, idx: i };
+  measure();
+  const el1 = render(env, propsWithData);
+  const flat1 = (el1.children || []).flat(Infinity).filter(Boolean);
+  const rendered1 = flat1.filter((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1);
+  const texts1 = rendered1.map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" | ");
+  const marker1 = flat1.find((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("ellipsis") !== -1);
+  check("trailing ⋯: order preserved, overflow falls into ⋯",
+    !!marker1 && texts1.indexOf("⋯") !== -1 &&
+    /^(高峰中|空闲中)/.test(texts1) && texts1.indexOf("本轮") !== -1 &&
+    texts1.indexOf("LLM 45s") === -1 && texts1.indexOf("输入 1000 · 输出 200") === -1,
+    texts1);
+
+  // wide line → everything fits, no marker
+  const env2 = makeEnv();
+  render(env2, propsWithData);
+  const lineRef2 = env2.states[4];
+  const itemRef2 = env2.states[7];
+  const probeRef2 = env2.states[8];
+  lineRef2.current = { clientWidth: 1000 };
+  probeRef2.current = { offsetWidth: 20 };
+  for (let i = 0; i < 7; i++) itemRef2.current[i] = { offsetWidth: 60, idx: i };
+  env2.states[9].current();
+  const el2 = render(env2, propsWithData);
+  const flat2 = (el2.children || []).flat(Infinity).filter(Boolean);
+  check("no ⋯ when everything fits",
+    !flat2.some((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("ellipsis") !== -1),
+    "marker present");
+}
+
+// Scenario 22: the FIRST step of a turn prices exactly even though the
+// browser stream only carries the usage chunk (no message usage/model) —
+// the last-known model (seeded from currentModel) prices the fold.
+{
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    { type: "step/start", data: { turn: 1, step: 1 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["s".repeat(700)] } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 } } } },
+    { type: "assistant/message", data: { turn: 1, step: 1, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "step/end", data: { turn: 1, step: 1 } },
+    { type: "step/start", data: { turn: 1, step: 2 } }
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
+    }
+  };
+  const runningProps = {
+    ...propsWithData,
+    useSessions: () => ({ byId: { "session-test": { running: true } } })
+  };
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const hp = now.getUTCHours();
+  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
+  const missP = pk ? 3.0 : 1.5;
+  const readP = pk ? 0.1 : 0.05;
+  const outP = pk ? 9.0 : 4.5;
+  // exact fold of step 1 (priced with the seeded model): 100×miss + 500×read + 4200×out
+  const step1 = (100 * missP + 500 * readP + 4200 * outP) / 1e6;
+  const t = groupTextsOf(render(env, runningProps));
+  check("first-step exact fold is priced (精确 not stuck at 0)",
+    Math.abs(cnyOf(t) - step1) < 1e-4 && t.indexOf("本轮 ¥" + step1.toFixed(4)) !== -1,
+    t + " expected " + step1.toFixed(4));
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");

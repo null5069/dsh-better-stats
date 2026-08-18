@@ -1,0 +1,109 @@
+// Cordis host-entry smoke test. In real DSH, plugin configuration is passed as
+// apply(ctx, config); ctx.config is an injected service accessor and reading it
+// without declaring an injection aborts the whole plugin tree.
+import { apply } from "../lib/index.js";
+
+let failures = 0;
+function check(name, condition, detail = "") {
+  console.log(`${condition ? "PASS" : "FAIL"}: ${name}${!condition && detail ? ` — ${detail}` : ""}`);
+  if (!condition) failures += 1;
+}
+
+const routes = new Map();
+const ctx = {
+  get config() {
+    throw new Error("ctx.config must never be read");
+  },
+  credentials: { resolve: async () => null },
+  sessions: {
+    list: () => [],
+    get: (id) => id === "session-smoke" ? { events: [] } : void 0,
+  },
+  webServer: {
+    register(route) {
+      routes.set(route.path, route.handler);
+      return () => routes.delete(route.path);
+    },
+  },
+  inject() {
+    // sessionPersistence is optional; the smoke test leaves it absent.
+  },
+  effect(factory, label) {
+    // Avoid the startup pricing fetch; execute only deterministic route setup.
+    if (label.includes(" route")) return factory();
+    return () => {};
+  },
+};
+
+apply(ctx, { dailyBudgetCny: 20, monthlyBudgetCny: 100 });
+check("host apply does not read uninjected ctx.config", true);
+check("all host routes register", routes.size === 4, JSON.stringify([...routes.keys()]));
+
+// Deterministic rate source: /balance's usdCnyRate must not hit the network.
+globalThis.fetch = async () => ({
+  ok: true,
+  json: async () => ({ rates: { CNY: 7.2 } }),
+});
+
+async function callRoute(path, query = "") {
+  return new Promise((resolve) => {
+    let status = null;
+    let body = null;
+    const handler = routes.get(path);
+    handler(
+      { url: path + query },
+      {
+        writeHead(s) { status = s; },
+        end(payload) { body = JSON.parse(payload); resolve({ status, body }); },
+      },
+    );
+  });
+}
+
+const live = await callRoute("/plugins/better-stats/live", "?sessionId=session-smoke");
+check("live route responds", live.status === 200, String(live.status));
+check(
+  "Cordis config reaches budget payload",
+  live.body?.budget?.daily === 20 && live.body?.budget?.monthly === 100,
+  JSON.stringify(live.body?.budget),
+);
+check("balance alert defaults to two tiers (warn 20 / critical 5)",
+  live.body?.budget?.balanceWarnCny === 20 && live.body?.budget?.balanceCriticalCny === 5,
+  JSON.stringify(live.body?.budget));
+check("live route carries pricing + unpricedSteps",
+  live.body?.pricing?.source === "builtin" && live.body?.unpricedSteps === 0,
+  JSON.stringify({ pricing: live.body?.pricing, unpricedSteps: live.body?.unpricedSteps }));
+
+const cost = await callRoute("/plugins/better-stats/cost", "?sessionId=session-smoke");
+check("cost route responds for an empty session",
+  cost.status === 200 && cost.body?.costCny === 0 && cost.body?.descendantCount === 0,
+  JSON.stringify(cost));
+check("cost route carries pricing + budget",
+  cost.body?.pricing?.source === "builtin" && cost.body?.budget?.daily === 20,
+  JSON.stringify({ pricing: cost.body?.pricing, budget: cost.body?.budget }));
+
+const today = await callRoute("/plugins/better-stats/today");
+check("today route responds with zero spend",
+  today.status === 200 && today.body?.costCny === 0 && today.body?.monthCostCny === 0,
+  JSON.stringify(today));
+check("today route reports the Beijing date", /^\d{4}-\d{2}-\d{2}$/.test(today.body?.date ?? ""), today.body?.date);
+
+const balance = await callRoute("/plugins/better-stats/balance");
+check("balance route degrades without a key",
+  balance.status === 200 && balance.body?.configured === false && balance.body?.usdCnyRate === 7.2,
+  JSON.stringify(balance));
+
+// Re-apply with custom tiers: routes re-register (Map upsert), the new
+// config must win; tiers can also be disabled with 0.
+apply(ctx, { balanceWarnCny: 30, balanceCriticalCny: 0 });
+const live2 = await callRoute("/plugins/better-stats/live", "?sessionId=session-smoke");
+check("custom balance tiers override the defaults",
+  live2.body?.budget?.balanceWarnCny === 30 && live2.body?.budget?.balanceCriticalCny === 0 &&
+  live2.body?.budget?.daily === void 0 && live2.body?.budget?.monthly === void 0,
+  JSON.stringify(live2.body?.budget));
+
+if (failures > 0) {
+  console.error(`\n${failures} HOST APPLY CHECK(S) FAILED`);
+  process.exit(1);
+}
+console.log("\nALL HOST APPLY CHECKS PASSED");
