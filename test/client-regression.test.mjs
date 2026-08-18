@@ -337,6 +337,12 @@ function groupTextsOf(el) {
   return flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
     .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
 }
+// parse the 本轮 amount out of the rendered line text (float-tolerant
+// comparisons — addition order differs between client and test)
+function cnyOf(text) {
+  const m = String(text).match(/本轮 ¥([\d.]+)/);
+  return m ? Number(m[1]) : NaN;
+}
 // flat() does not descend into element .children properties — collect strings
 // recursively instead.
 function collectStrings(node, out) {
@@ -459,9 +465,10 @@ const HOST_TABLES = {
 // text-chunks / tool-call-chunks) carry the FULL streamed text; tokens are
 // estimated at per-kind density and reset by the step's usage chunk (P1-5).
 // Densities mirror the client: reasoning 3.5, text 4, tool args 1.6
-// (non-CJK chars/token; CJK ≈ 1 token/char).
+// (non-CJK chars/token; CJK ≈ 1 token/char). 本轮 base = the turn fold.
 {
   const events = [
+    { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["x".repeat(3500), "y".repeat(500)] } },
     { type: "tool-call-chunks", data: { turn: 1, step: 1, id: "c1", name: "read", args: ["{\"a\":", "1}"] } }
@@ -491,15 +498,19 @@ const HOST_TABLES = {
   const est2 = (4000 / 3.5 + 6 / 1.6 + 4000 / 4) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
   check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4) + "(估)") !== -1, t2 + " expected " + est2.toFixed(4));
-  // usage chunk lands → estimate resets to 0 (exact figures take over)
+  // usage chunk lands → estimate resets; the turn fold shows the EXACT step
+  // cost (no (估) marker). The assistant/message (which carries the model)
+  // follows in the real stream and corrects the fold's price.
   events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 } } } });
+  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 }, message: { source: { model: "deepseek-v4-flash" } } } });
+  const step1Exact = (100 * (peak ? 3.0 : 1.5) + 5000 * (peak ? 0.1 : 0.05) + 8000 * outP) / 1e6;
   const t3 = groupTextsOf(render(env, runningProps));
-  check("estimate removed after usage lands", t3.indexOf("(估)") === -1 && /本轮 ¥0\.0000/.test(t3), t3);
-  // next step starts → input estimate carried from the previous usage
-  // (100×miss + 5000×read at the current tier) + new reasoning estimate
+  check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 1e-4, t3 + " expected " + step1Exact.toFixed(4));
+  // next step starts → base stays (turn fold) + carried input cost + new
+  // reasoning estimate (100×miss + 5000×read at the current tier)
   events.push({ type: "step/end", data: { turn: 1, step: 1 } });
-  events.push({ type: "step/start", data: { turn: 2, step: 1 } });
-  events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["z".repeat(700)] } });
+  events.push({ type: "step/start", data: { turn: 1, step: 2 } });
+  events.push({ type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["z".repeat(700)] } });
   const d2 = new Date(Date.now() + 8 * 3600 * 1000);
   const h2 = d2.getUTCHours();
   const peak2 = (h2 >= 9 && h2 < 12) || (h2 >= 14 && h2 < 18);
@@ -507,9 +518,69 @@ const HOST_TABLES = {
   const readP = peak2 ? 0.1 : 0.05;
   const outP2 = peak2 ? 9.0 : 4.5;
   const inputCny = (100 * missP + 5000 * readP) / 1e6;
-  const est4 = inputCny + 700 / 3.5 * outP2 / 1e6;
+  const est4 = step1Exact + inputCny + 700 / 3.5 * outP2 / 1e6;
   const t4 = groupTextsOf(render(env, runningProps));
-  check("next-step estimate includes carried input cost", t4.indexOf("本轮 ¥" + est4.toFixed(4) + "(估)") !== -1, t4 + " expected " + est4.toFixed(4));
+  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") !== -1 && Math.abs(cnyOf(t4) - est4) < 1e-4, t4 + " expected " + est4.toFixed(4));
+}
+
+// Scenario 18: 本轮 is TURN-scoped — the fold restarts at turn/start and
+// turn/end, so multi-step turns accumulate and complete turns reset to 0.
+{
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    { type: "step/start", data: { turn: 1, step: 1 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["a".repeat(3500)] } },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "step/end", data: { turn: 1, step: 1 } },
+    { type: "step/start", data: { turn: 1, step: 2 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["b".repeat(700)] } }
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
+    }
+  };
+  const runningProps = {
+    ...propsWithData,
+    useSessions: () => ({ byId: { "session-test": { running: true } } })
+  };
+  const now = new Date(Date.now() + 8 * 3600 * 1000);
+  const hp = now.getUTCHours();
+  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
+  const missP = pk ? 3.0 : 1.5;
+  const readP = pk ? 0.1 : 0.05;
+  const outP = pk ? 9.0 : 4.5;
+  // turn 1 step 1 settled: 100×miss + 500×read + 4000×out
+  const step1 = (100 * missP + 500 * readP + 4000 * outP) / 1e6;
+  // step 2 in flight: 700 reasoning chars / 3.5 = 200 tokens + carried input
+  const inputCarry = (100 * missP + 500 * readP) / 1e6;
+  const turn1Shown = step1 + inputCarry + 200 * outP / 1e6;
+  const t1 = groupTextsOf(render(env, runningProps));
+  check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") !== -1 && Math.abs(cnyOf(t1) - turn1Shown) < 1e-4, t1 + " expected " + turn1Shown.toFixed(4));
+  // turn 1 completes, turn 2 starts with fresh reasoning → base resets
+  events.push({ type: "step/end", data: { turn: 1, step: 2 } });
+  events.push({ type: "turn/end", data: { turn: 1 } });
+  events.push({ type: "turn/start", data: { turn: 2 } });
+  events.push({ type: "step/start", data: { turn: 2, step: 1 } });
+  events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["c".repeat(700)] } });
+  const turn2Shown = inputCarry + 200 * outP / 1e6; // fold reset; only estimate + carried input
+  const t2 = groupTextsOf(render(env, runningProps));
+  check("turn/end resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") !== -1 && Math.abs(cnyOf(t2) - turn2Shown) < 1e-4, t2 + " expected " + turn2Shown.toFixed(4));
+  // restored-session history (pre-loaded events without a turn/start) never
+  // leaks into 本轮 before the first turn boundary
+  const histEvents = [
+    { type: "step/start", data: { turn: 9, step: 1 } },
+    { type: "assistant/message", data: { turn: 9, step: 1, usage: { inputTokens: 9000, outputTokens: 9000, cacheReadTokens: 9000 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "step/end", data: { turn: 9, step: 1 } }
+  ];
+  applyWith({ binding: () => ({ session: { events: histEvents } }) });
+  const envH = makeEnv();
+  envH.states[17] = env.states[17];
+  const tH = groupTextsOf(render(envH, runningProps));
+  check("pre-loaded history stays out of 本轮 (fold starts at turn/start)", /本轮 ¥0\.0000/.test(tH) && tH.indexOf("(估)") === -1, tH);
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
