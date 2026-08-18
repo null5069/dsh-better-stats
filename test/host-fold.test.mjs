@@ -2,7 +2,7 @@
 // Verifies foldUsage (the dsh-token-meter mirror) and the tree merge on the
 // actual corpus, plus the fold's no-double-count semantics.
 import { readFileSync } from "node:fs";
-import { foldLive, foldUsage as realFoldUsage } from "../lib/index.js";
+import { foldLive, foldUsage as realFoldUsage, parsePricingHtml, modelKeyOf as realModelKeyOf } from "../lib/index.js";
 import { readdirSync } from "node:fs";
 
 const DIR = "/tmp/dsh-session-test";
@@ -236,6 +236,73 @@ check("foldLive on real log (llmMs>0, steps>0)",
 // pending on a dead session can never tick. Assert the fold surfaces it:
 check("foldLive surfaces the in-flight tool (capture artifact)",
   typeof realLive.pendingMin === "number" || realLive.pendingMin === null, JSON.stringify(realLive.pendingMin));
+
+// ── v20 P0-1: official pricing parser ─────────────────────────────────────
+// Sample fragment mirroring the Docusaurus article structure (one table,
+// models as columns: flash then pro).
+const SAMPLE_HTML = `<article><h1>模型 &amp; 价格</h1><p>deepseek-v4-flash deepseek-v4-pro</p><table>
+<tbody>
+<tr><th>百万tokens输入（缓存命中）</th><td>空闲时段 0.05元 0.15元</td><td>高峰时段 0.10元 0.30元</td></tr>
+<tr><th>百万tokens输入（缓存未命中）</th><td>空闲时段 1.5元 4.5元</td><td>高峰时段 3.0元 9.0元</td></tr>
+<tr><th>百万tokens输出</th><td>空闲时段 4.5元 13.5元</td><td>高峰时段 9.0元 27.0元</td></tr>
+</tbody></table></article>`;
+const parsed = parsePricingHtml(SAMPLE_HTML);
+check("parser extracts the twelve official numbers",
+  parsed !== null &&
+  parsed["deepseek-v4-flash"].miss === 1.5 && parsed["deepseek-v4-flash"].read === 0.05 && parsed["deepseek-v4-flash"].out === 4.5 &&
+  parsed["deepseek-v4-flash"].missPeak === 3.0 && parsed["deepseek-v4-flash"].readPeak === 0.1 && parsed["deepseek-v4-flash"].outPeak === 9.0 &&
+  parsed["deepseek-v4-pro"].miss === 4.5 && parsed["deepseek-v4-pro"].read === 0.15 && parsed["deepseek-v4-pro"].out === 13.5 &&
+  parsed["deepseek-v4-pro"].missPeak === 9.0 && parsed["deepseek-v4-pro"].readPeak === 0.3 && parsed["deepseek-v4-pro"].outPeak === 27.0,
+  JSON.stringify(parsed));
+check("parser rejects garbage html", parsePricingHtml("<html>no prices here</html>") === null);
+check("parser rejects structural surprise (missing model names)", parsePricingHtml(SAMPLE_HTML.replace("deepseek-v4-flash", "other-model")) === null);
+check("parser rejects invalid numbers (miss < read)", parsePricingHtml(SAMPLE_HTML.replace("1.5元", "0.01元")) === null);
+check("parser rejects non-doubling peak", parsePricingHtml(SAMPLE_HTML.replace("9.0元 27.0元", "9.5元 27.0元")) === null);
+// the live page (when the fixture is present) must keep parsing
+try {
+  const liveHtml = readFileSync("/tmp/ds-pricing.html", "utf8");
+  const liveParsed = parsePricingHtml(liveHtml);
+  check("parser works on the live official page",
+    liveParsed !== null && liveParsed["deepseek-v4-flash"].out === 4.5 && liveParsed["deepseek-v4-pro"].out === 13.5,
+    JSON.stringify(liveParsed));
+} catch {
+  check("parser on live page (fixture missing — skipped)", true);
+}
+
+// ── v20 P0-2: unknown model explicit marking ──────────────────────────────
+check("modelKeyOf is three-state",
+  realModelKeyOf("deepseek-v4-pro-0813") === "deepseek-v4-pro" &&
+  realModelKeyOf("deepseek-v4-flash-0731") === "deepseek-v4-flash" &&
+  realModelKeyOf("gpt-4o") === "unknown" && realModelKeyOf(void 0) === "unknown" &&
+  realModelKeyOf(null) === "unknown",
+  JSON.stringify([realModelKeyOf("deepseek-v4-pro-0813"), realModelKeyOf("gpt-4o")]));
+const UNKNOWN_FOLD = realFoldUsage([
+  { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "mystery-model" } } } }
+]);
+check("unknown tokens counted but not priced",
+  UNKNOWN_FOLD.totals.outputTokens === 1000 && UNKNOWN_FOLD.totals.uncachedInputTokens === 1000 &&
+  UNKNOWN_FOLD.costCny === 0 && UNKNOWN_FOLD.unpricedSteps === 1 &&
+  UNKNOWN_FOLD.byModel.get("unknown") !== void 0 && UNKNOWN_FOLD.byModel.get("unknown").costCny === 0,
+  JSON.stringify({ totals: UNKNOWN_FOLD.totals, costCny: UNKNOWN_FOLD.costCny, unpricedSteps: UNKNOWN_FOLD.unpricedSteps, keys: [...UNKNOWN_FOLD.byModel.keys()] }));
+const KNOWN_FOLD = realFoldUsage([
+  { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+]);
+check("known model has zero unpriced steps", KNOWN_FOLD.unpricedSteps === 0 && KNOWN_FOLD.costCny === 0.00605, JSON.stringify(KNOWN_FOLD));
+
+// ── v20 P1-3: sinceMs filter (the "today" fold core) ──────────────────────
+const TODAY_SINCE = Date.UTC(2026, 7, 17, 16, 0); // 2026-08-18 00:00 Beijing
+const TODAY_FOLD = realFoldUsage([
+  { type: "assistant/message", time: Date.UTC(2026, 7, 17, 10, 0), data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } },
+  { type: "assistant/message", time: Date.UTC(2026, 7, 18, 0, 30), data: { turn: 2, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+], { sinceMs: TODAY_SINCE });
+check("sinceMs keeps only today's samples",
+  TODAY_FOLD.totals.outputTokens === 1000 && TODAY_FOLD.unpricedSteps === 0 &&
+  Math.abs(TODAY_FOLD.costCny - 0.00605) < 1e-12,
+  JSON.stringify({ totals: TODAY_FOLD.totals, costCny: TODAY_FOLD.costCny }));
+const TODAY_EMPTY = realFoldUsage([
+  { type: "assistant/message", time: Date.UTC(2026, 7, 17, 10, 0), data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+], { sinceMs: TODAY_SINCE });
+check("sinceMs with no samples → zero cost", TODAY_EMPTY.costCny === 0 && TODAY_EMPTY.totals.outputTokens === 0, JSON.stringify(TODAY_EMPTY));
 
 console.log(failures === 0 ? "\nALL HOST-FOLD CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

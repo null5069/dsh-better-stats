@@ -1,6 +1,13 @@
 # dsh-better-stats bundle patch: registers the stats-strip plugin row.
 # Applied automatically when this package is listed in the profile's
 # dsh.profile.bundles (see README install steps).
+#
+# config (all optional):
+#   dailyBudgetCny / monthlyBudgetCny — budget alerts (client marks the 花费
+#   group amber at 80%, red with ⚠ over budget; hover shows 今日/本月 totals).
 - insert:
     - id: better-stats
       name: dsh-better-stats
+      config:
+        dailyBudgetCny: 20
+        monthlyBudgetCny: 100

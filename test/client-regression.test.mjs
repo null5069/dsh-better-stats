@@ -3,7 +3,7 @@
 //  1. plugin loads via the ModuleLoader protocol and apply() registers the
 //     dock entry;
 //  2. with usage+stats data and no balance yet, the line still renders;
-//  3. with NO data at all, the placeholder (data-bs="v18-empty") renders
+//  3. with NO data at all, the placeholder (data-bs="v20-empty") renders
 //     instead of silently returning null;
 //  4. measureSeps never throws even when refs arrays hold undefined holes
 //     (the exact condition that crashed and got the entry abdicated);
@@ -156,7 +156,7 @@ const propsNoData = {
 {
   const env = makeEnv();
   const el = render(env, propsNoData);
-  check("no-data renders placeholder v18-empty", !!(el && el.props && el.props["data-bs"] === "v18-empty"), JSON.stringify(el).slice(0, 140));
+  check("no-data renders placeholder v20-empty", !!(el && el.props && el.props["data-bs"] === "v20-empty"), JSON.stringify(el).slice(0, 140));
 }
 
 // Scenario 2: data present, no balance yet → full line with groups
@@ -165,7 +165,7 @@ const propsNoData = {
   const el = render(env, propsWithData);
   const flat = (el.children || []).flat(Infinity).filter(Boolean);
   const groups = flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1);
-  check("data line renders (data-bs=v18)", !!(el && el.props && el.props["data-bs"] === "v18"), JSON.stringify(el).slice(0, 140));
+  check("data line renders (data-bs=v20)", !!(el && el.props && el.props["data-bs"] === "v20"), JSON.stringify(el).slice(0, 140));
   check("data line has group items", groups.length >= 3, "items=" + groups.length);
   const text = groups.map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
   console.log("  line text:", text);
@@ -201,7 +201,7 @@ const propsNoData = {
   // group math that balance group appears when cache present — simulate by
   // pre-seeding: temporarily wrap useState via a sub-proxy is complex, so
   // just assert scenario 2 already covers non-empty groups; skip.
-  check("balance-less line already renders groups", !!(el1 && el1.props && el1.props["data-bs"] === "v18"));
+  check("balance-less line already renders groups", !!(el1 && el1.props && el1.props["data-bs"] === "v20"));
 }
 
 // Scenario 4: THE crash condition — measureSeps with refs full of undefined
@@ -215,8 +215,8 @@ const propsNoData = {
   // effects right after render, and refs are attached during "commit"
   // (before effects) in real React. To simulate the RO racing commit, call
   // the effect callback manually with holes in the ref arrays.
-  // Find the effects' closures: they read module-scope refs (sepRefs.current
-  // etc.) at call time, so sabotaging env.states' ref values works.
+  // Find the effects' closures: they read the component refs at call time,
+  // so leaving those refs unattached reproduces the commit race safely.
   const refStates = env.states.filter((s) => s && typeof s.current !== "undefined" && Array.isArray(s.current));
   const sepRefState = refStates.find((s) => s.current.length === 0 || Array.isArray(s.current));
   // Actually the refs arrays start [] and get filled by ref callbacks during
@@ -232,47 +232,46 @@ const propsNoData = {
   const env = makeEnv();
   const el = render(env, propsWithData);
   const el2 = render(env, propsWithData); // re-render, same env
-  check("re-render stable", !!(el2 && el2.props && el2.props["data-bs"] === "v18"));
+  check("re-render stable", !!(el2 && el2.props && el2.props["data-bs"] === "v20"));
 }
 
-// Scenario 6: the WRAP RULE — a separator is dropped when a line break
-// separates it from either neighbour (stranded at end of previous line, or
-// orphaned at start of next line); kept only between two groups on the same
-// line. (Hook order: 7=itemRefs, 8=sepRefs, 9=measureRef, 5=sepHidden.)
+// Scenario 6: deterministic wrap calculation. It uses natural widths rather
+// than offsetTop from the already-mutated layout, so hiding a separator cannot
+// pull a group back and then make the separator visible again (the old flicker
+// loop). Hook order: 4=lineRef, 5=sepHidden, 7=itemRefs, 8=probe, 9=measure.
 {
   const env = makeEnv();
-  render(env, propsWithData); // 5 groups (花费/轮次/耗时/速率/Token), 4 seps
-  const itemRef = env.states[7]; // { current: [] } — item refs array
-  const sepRef = env.states[8];  // { current: [] } — separator refs array
-  const measure = env.states[9].current; // latest measureSeps
+  render(env, propsWithData);
+  const lineRef = env.states[4];
+  const itemRef = env.states[7];
+  const probeRef = env.states[8];
+  const measure = env.states[9].current;
   const hidden = () => env.states[5].value;
-  // simulate commit: 5 items + 4 seps, all on line 1 (offsetTop 100)
-  for (let i = 0; i < 6; i++) itemRef.current[i] = { offsetTop: 100 };
-  for (let i = 1; i < 6; i++) sepRef.current[i] = { offsetTop: 100 };
+
+  // Six groups; separator natural width is 20. At 300px the third
+  // separator begins a new row, while the following two fit that row.
+  lineRef.current = { clientWidth: 300 };
+  probeRef.current = { offsetWidth: 20 };
+  [80, 90, 70, 60, 50, 40].forEach((width, i) => {
+    itemRef.current[i] = { offsetWidth: width, idx: i };
+  });
   measure();
-  check("all on one line -> all separators visible", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
-  // sep1 stranded at END of line 1: same line as item0, but item1 wrapped
-  itemRef.current[1] = { offsetTop: 200 };
+  check("width simulation hides only the row-boundary separator",
+    JSON.stringify(hidden()) === "[false,false,true,false,false]",
+    JSON.stringify(hidden()));
+
+  // Same geometry produces the same array object — no state feedback loop.
+  const stable = hidden();
   measure();
-  check("sep at end of previous line is dropped", hidden()[0] === true, JSON.stringify(hidden()));
-  // sep2 between two line-2 groups stays visible
-  itemRef.current[2] = { offsetTop: 200 };
-  sepRef.current[2] = { offsetTop: 200 };
-  measure();
-  check("sep between two same-line groups stays", hidden()[1] === false, JSON.stringify(hidden()));
-  // sep3 orphaned at START of next line: same line as item3, item2 above
-  itemRef.current[3] = { offsetTop: 300 };
-  sepRef.current[3] = { offsetTop: 300 };
-  measure();
-  check("sep at start of next line is dropped", hidden()[2] === true, JSON.stringify(hidden()));
-  // recovery: window widens, everything back on one line -> all visible
-  for (let i = 0; i < 6; i++) itemRef.current[i] = { offsetTop: 100 };
-  for (let i = 1; i < 6; i++) sepRef.current[i] = { offsetTop: 100 };
+  check("same geometry does not schedule a toggling state", hidden() === stable);
+
+  lineRef.current.clientWidth = 1000;
   measure();
   check("re-flow restores separators", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
 }
 
-// Scenario 9: ref-index capture — the closure bug that hid ALL separators.
+// Scenario 9: ref-index capture — every group keeps its own natural-width ref,
+// and the hidden probe remains separate from real separator elements.
 // React calls ref callbacks at COMMIT time; a callback closing over the loop
 // `var gi` would see the FINAL index and write every element to the same
 // slot. Simulate a commit and verify each index lands in its own slot.
@@ -282,23 +281,28 @@ const propsNoData = {
   const el = render(env, propsWithData);
   const flat = (el.children || []).flat(Infinity).filter(Boolean);
   const itemRef = env.states[7];
-  const sepRef = env.states[8];
+  const lineRef = env.states[4];
+  const probeRef = env.states[8];
   const groupSpans = flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1);
-  const sepSpans = flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("sep") !== -1);
-  groupSpans.forEach((sp, i) => sp.props.ref({ offsetTop: 100, idx: i }));
-  sepSpans.forEach((sp, i) => sp.props.ref({ offsetTop: 100, idx: i }));
-  check("ref callbacks capture per-index elements (no closure bug)",
+  const probeSpan = flat.find((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("sep-probe") !== -1);
+  groupSpans.forEach((sp, i) => sp.props.ref({ offsetWidth: 50, idx: i }));
+  probeSpan.props.ref({ offsetWidth: 20, probe: true });
+  check("group refs capture per-index elements and probe is isolated",
     itemRef.current.length === groupSpans.length &&
-    itemRef.current.every((e, i) => e !== void 0 && e.idx === i && e.offsetTop === 100) &&
-    sepRef.current.length === sepSpans.length + 1 &&
-    sepRef.current.every((e, i) => i === 0 || (e !== void 0 && e.idx === i - 1 && e.offsetTop === 100)),
-    "itemRef=" + JSON.stringify(itemRef.current.map((e) => e && e.idx)) + " sepRef=" + JSON.stringify(sepRef.current.map((e) => e && e.idx)));
-  // with refs attached and all items on the same line, measure must keep seps
+    itemRef.current.every((e, i) => e !== void 0 && e.idx === i && e.offsetWidth === 50) &&
+    probeRef.current && probeRef.current.probe === true,
+    "itemRef=" + JSON.stringify(itemRef.current.map((e) => e && e.idx)));
+
+  lineRef.current = { clientWidth: 1000 };
   const measure = env.states[9].current;
   const hidden = () => env.states[5].value;
   measure();
-  check("measure with attached refs keeps same-line separators", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
+  check("natural-width measure keeps same-line separators", JSON.stringify(hidden()) === "[false,false,false,false,false]", JSON.stringify(hidden()));
 }
+
+// Scenario 10: wrapping is never clipped to two rows.
+check("stats line no longer clips wrapped rows",
+  code.includes("max-height:none;overflow:visible") && !code.includes("max-height:44px;overflow:hidden"));
 
 // Scenario 12: 本轮 prices ONLY the new usage — no retroactive re-pricing
 {
@@ -325,6 +329,187 @@ const propsNoData = {
   // same usage again → no change (no phantom from re-pricing)
   const t2 = textOf(render(env, props));
   check("本轮 unchanged when usage unchanged", t1 === t2, t2);
+}
+
+// ── v20 helpers: group text / popover text extraction ──────────────────────
+function groupTextsOf(el) {
+  const flat = (el.children || []).flat(Infinity).filter(Boolean);
+  return flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
+    .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
+}
+// flat() does not descend into element .children properties — collect strings
+// recursively instead.
+function collectStrings(node, out) {
+  if (typeof node === "string") { out.push(node); return; }
+  if (node === null || node === void 0 || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const c of node) collectStrings(c, out);
+    return;
+  }
+  if (typeof node.children !== "undefined") collectStrings(node.children, out);
+}
+function popTextOf(el) {
+  const flat = (el.children || []).flat(Infinity).filter(Boolean);
+  const pop = flat.find((c) => c && typeof c === "object" && c.props && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-pop") !== -1 && c.props.className.indexOf("pop-row") === -1);
+  if (!pop) return "";
+  const out = [];
+  collectStrings(pop.children, out);
+  return out.join(" ");
+}
+const HOST_TABLES = {
+  "deepseek-v4-flash": { miss: 1.5, read: 0.05, out: 4.5, missPeak: 3.0, readPeak: 0.1, outPeak: 9.0 },
+  "deepseek-v4-pro": { miss: 4.5, read: 0.15, out: 13.5, missPeak: 9.0, readPeak: 0.3, outPeak: 27.0 }
+};
+
+// Scenario 13: unknown-model steps — session amount gets ≈ and a popover
+// note (v20 P0-2). Seeded liveInfo carries host unpricedSteps; no budget.
+// Hook indices (v20): 1=balance 2=hovered 3=anchor 13=todayState 17=liveInfo.
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05,
+      models: [{ model: "deepseek-v4-flash", usage: TOKEN_USAGE, costCny: 0.04 }, { model: "unknown", usage: TOKEN_USAGE, costCny: 0 }],
+      unpricedSteps: 3,
+      pricing: null, budget: null
+    }
+  };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const text = groupTextsOf(el);
+  const pop = popTextOf(el);
+  check("unknown steps mark session amount with ≈", text.indexOf("会话 ≈¥0.0500") !== -1, text);
+  check("unpriced popover note present", pop.indexOf("含 3 步未定价 · 模型未知") !== -1, pop);
+  check("builtin price-source fallback in popover", pop.indexOf("内置价目(可能过期)") !== -1, pop);
+}
+
+// Scenario 14: budget warn/over — amber ⚠ at ≥80%, red ⚠ over budget.
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null,
+      budget: { daily: 20, monthly: 100 }
+    }
+  };
+  env.states[13] = { value: { costCny: 18, monthCostCny: 60, sessionCount: 4 } };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const flat = (el.children || []).flat(Infinity).filter(Boolean);
+  const spendSpan = flat.find((c) => c && c.props && typeof c.props.className === "string" &&
+    c.props.className.indexOf("item") !== -1 && String((c.children || []).join ? (c.children || []).join("") : "").indexOf("本轮") !== -1);
+  const spendText = (spendSpan && spendSpan.children || []).join("");
+  check("budget warn: ⚠ prefix at 90%", /^⚠ /.test(spendText), spendText);
+  check("budget warn: amber color", !!(spendSpan && spendSpan.props.style && spendSpan.props.style.color === "#f59e0b"), JSON.stringify(spendSpan && spendSpan.props.style));
+  const pop = popTextOf(el);
+  check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.0000 · 日预算 ¥20.0000 (90%)") !== -1, pop);
+  check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.0000 · 月预算 ¥100.0000 (60%)") !== -1, pop);
+
+  // over budget → red
+  const env2 = makeEnv();
+  env2.states[17] = env.states[17];
+  env2.states[13] = { value: { costCny: 21, monthCostCny: 60, sessionCount: 4 } };
+  const el2 = render(env2, propsWithData);
+  const flat2 = (el2.children || []).flat(Infinity).filter(Boolean);
+  const spendSpan2 = flat2.find((c) => c && c.props && typeof c.props.className === "string" &&
+    c.props.className.indexOf("item") !== -1 && String((c.children || []).join ? (c.children || []).join("") : "").indexOf("本轮") !== -1);
+  const spendText2 = (spendSpan2 && spendSpan2.children || []).join("");
+  check("budget over: ⚠ prefix and red color", /^⚠ /.test(spendText2) && spendSpan2.props.style.color === "#ef4444", spendText2 + " " + JSON.stringify(spendSpan2 && spendSpan2.props.style));
+}
+
+// Scenario 15: balance split + peak countdown in the 余额 hover (P1-4).
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[1] = { value: { text: "DeepSeek 官方 ¥8.6700", label: "DeepSeek 官方", amount: 8.67, currency: "CNY", granted: 3.2, toppedUp: 5.47 } };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const pop = popTextOf(el);
+  check("balance split shown in hover", pop.indexOf("余额 ¥8.6700（赠送 ¥3.2000 · 充值 ¥5.4700）") !== -1, pop);
+  check("peak countdown line in hover", /(高峰进行中|空闲) · (高峰|空闲) \d{2}:00 开始（.+后）/.test(pop), pop);
+}
+
+// Scenario 16: official price-source label (P0-1) — host pricing payload.
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0,
+      pricing: { source: "official", fetchedAt: new Date().toISOString(), tables: HOST_TABLES },
+      budget: null
+    }
+  };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const pop = popTextOf(el);
+  check("official price source shown", /价格源：官方 \d{2}:\d{2} 更新/.test(pop), pop);
+}
+
+// Scenario 17: streaming estimate — batch events (reasoning-chunks /
+// text-chunks / tool-call-chunks) carry the FULL streamed text; tokens are
+// estimated at per-kind density and reset by the step's usage chunk (P1-5).
+// Densities mirror the client: reasoning 3.5, text 4, tool args 1.6
+// (non-CJK chars/token; CJK ≈ 1 token/char).
+{
+  const events = [
+    { type: "step/start", data: { turn: 1, step: 1 } },
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["x".repeat(3500), "y".repeat(500)] } },
+    { type: "tool-call-chunks", data: { turn: 1, step: 1, id: "c1", name: "read", args: ["{\"a\":", "1}"] } }
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  env.states[17] = {
+    value: {
+      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
+    }
+  };
+  const runningProps = {
+    ...propsWithData,
+    useSessions: () => ({ byId: { "session-test": { running: true } } })
+  };
+  const d = new Date(Date.now() + 8 * 3600 * 1000);
+  const h = d.getUTCHours();
+  const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
+  const outP = peak ? 9.0 : 4.5;
+  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args 6 chars / 1.6 = 3.75
+  const est1 = (4000 / 3.5 + 6 / 1.6) * outP / 1e6;
+  const t1 = groupTextsOf(render(env, runningProps));
+  check("streaming estimate from batch events with (估) mark", t1.indexOf("本轮 ¥" + est1.toFixed(4) + "(估)") !== -1, t1 + " expected " + est1.toFixed(4));
+  // stream grows (in-place push) → estimate grows (text-chunks at /4)
+  events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
+  const est2 = (4000 / 3.5 + 6 / 1.6 + 4000 / 4) * outP / 1e6;
+  const t2 = groupTextsOf(render(env, runningProps));
+  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4) + "(估)") !== -1, t2 + " expected " + est2.toFixed(4));
+  // usage chunk lands → estimate resets to 0 (exact figures take over)
+  events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 } } } });
+  const t3 = groupTextsOf(render(env, runningProps));
+  check("estimate removed after usage lands", t3.indexOf("(估)") === -1 && /本轮 ¥0\.0000/.test(t3), t3);
+  // next step starts → input estimate carried from the previous usage
+  // (100×miss + 5000×read at the current tier) + new reasoning estimate
+  events.push({ type: "step/end", data: { turn: 1, step: 1 } });
+  events.push({ type: "step/start", data: { turn: 2, step: 1 } });
+  events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["z".repeat(700)] } });
+  const d2 = new Date(Date.now() + 8 * 3600 * 1000);
+  const h2 = d2.getUTCHours();
+  const peak2 = (h2 >= 9 && h2 < 12) || (h2 >= 14 && h2 < 18);
+  const missP = peak2 ? 3.0 : 1.5;
+  const readP = peak2 ? 0.1 : 0.05;
+  const outP2 = peak2 ? 9.0 : 4.5;
+  const inputCny = (100 * missP + 5000 * readP) / 1e6;
+  const est4 = inputCny + 700 / 3.5 * outP2 / 1e6;
+  const t4 = groupTextsOf(render(env, runningProps));
+  check("next-step estimate includes carried input cost", t4.indexOf("本轮 ¥" + est4.toFixed(4) + "(估)") !== -1, t4 + " expected " + est4.toFixed(4));
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
