@@ -796,5 +796,107 @@ const HOST_TABLES = {
     t + " expected " + step1.toFixed(4));
 }
 
+// Scenario 23: v21 additions — ETA days-left row (sampled from /today),
+// force-refresh affordance on the balance group, and the recharge link on
+// critical balance. localStorage + /today fetch are mocked (Node has neither).
+{
+  const storage = {};
+  globalThis.localStorage = {
+    getItem: (k) => (k in storage ? storage[k] : null),
+    setItem: (k, v) => { storage[k] = String(v); },
+    removeItem: (k) => { delete storage[k]; },
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url) => {
+    if (String(url).indexOf("/plugins/better-stats/today") !== -1) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ date: "2026-08-18", since: 0, costCny: 0.5, monthCostCny: 3, unpricedSteps: 0, sessionCount: 1 }),
+      });
+    }
+    return Promise.reject(new Error("unexpected fetch " + url));
+  };
+  (async () => {
+    try {
+      applyWith({});
+      const env = makeEnv();
+      env.states[1] = { value: { text: "DeepSeek 官方 ¥100.00", label: "DeepSeek 官方", amount: 100, currency: "CNY", decimals: 2, granted: 40, toppedUp: 60 } };
+      env.states[2] = { value: true };
+      env.states[3] = { value: { left: 100, top: 100 } };
+      render(env, propsWithData);
+      await new Promise((r) => setTimeout(r, 0)); // flush the fetch then-callbacks
+      const el2 = render(env, propsWithData);
+      const pop = popTextOf(el2);
+      check("ETA days-left row in balance popover", /约可用 \d+ (天|小时)/.test(pop), pop);
+      check("refresh hint in balance popover", pop.indexOf("点击余额可强刷") !== -1, pop);
+      const flat2 = (el2.children || []).flat(Infinity).filter(Boolean);
+      const refreshItem = flat2.find((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-refresh") !== -1);
+      check("balance group is clickable (force refresh)", !!refreshItem && typeof refreshItem.props.onClick === "function", JSON.stringify(refreshItem && refreshItem.props));
+      const etaStored = JSON.parse(storage["dsh-better-stats:eta"] || "null");
+      check("ETA sample persisted (rate > 0)", etaStored !== null && Number(etaStored.rate) > 0, JSON.stringify(etaStored));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  })();
+  // Top-level await: the checks above must run BEFORE the final summary line.
+  await new Promise((r) => setTimeout(r, 20));
+}
+
+// Scenario 24: critical balance → recharge link in the popover
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[1] = { value: { text: "DeepSeek 官方 ¥3.00", label: "DeepSeek 官方", amount: 3, currency: "CNY", decimals: 2, granted: 0, toppedUp: 3 } };
+  env.states[2] = { value: true };
+  env.states[3] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const pop = popTextOf(el);
+  check("critical balance shows recharge link", pop.indexOf("充值 ↗") !== -1, pop);
+}
+
+// Scenario 25: English UI — reload the bundle with navigator.language en-US
+// and assert the i18n labels render.
+{
+  try {
+    Object.defineProperty(globalThis.navigator, "language", { value: "en-US", configurable: true });
+  } catch (e) { /* keep zh */ }
+  let enFactory = null;
+  globalThis.window.__ModuleLoader__.load = (handoff) => { enFactory = handoff.factory; };
+  new Function("window", "require", code)(globalThis.window, (spec) => {
+    if (spec === "react") return reactProxy();
+    throw new Error("unexpected require: " + spec);
+  });
+  if (enFactory) {
+    let enComp = null;
+    let enOpts = null;
+    // LANG is computed INSIDE the factory — restore the language only after
+    // the factory ran, so the en locale is what gets captured.
+    enFactory((spec) => {
+      if (spec === "react") return reactProxy();
+      throw new Error("unexpected require: " + spec);
+    }).apply({
+      sessions: {},
+      slots: {
+        inject(name, cb) { [enOpts, enComp] = cb(); },
+        register(o, c) { return [o, c]; },
+      },
+    });
+    // Route render() at the EN component (it renders the global Comp).
+    Comp = enComp;
+    options = enOpts;
+    try {
+      Object.defineProperty(globalThis.navigator, "language", { value: "zh-CN", configurable: true });
+    } catch (e) { /* ignore */ }
+    const env = makeEnv();
+    const el = render(env, propsWithData);
+    const flat = (el.children || []).flat(Infinity).filter(Boolean);
+    const texts = flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
+      .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
+    check("English UI: Turn/Session labels", texts.indexOf("Turn ") !== -1 && texts.indexOf("Session ") !== -1, texts);
+    check("English UI: peak/off-peak label", /(Peak|Off-peak)/.test(texts), texts);
+    check("English UI: In/Out token labels", /In \d/.test(texts) && /Out \d/.test(texts), texts);
+  }
+}
+
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

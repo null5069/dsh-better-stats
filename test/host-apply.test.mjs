@@ -93,6 +93,35 @@ check("balance route degrades without a key",
   balance.status === 200 && balance.body?.configured === false && balance.body?.usdCnyRate === 7.2,
   JSON.stringify(balance));
 
+// Force-refresh path: ?force=1 bypasses the cache, with a 2s anti-flood
+// cooldown between forced queries. Swap in a key + balance-shaped upstream
+// and count upstream calls.
+const realResolve = ctx.credentials.resolve;
+const realFetch = globalThis.fetch;
+let upstreamCalls = 0;
+ctx.credentials.resolve = async () => ({ value: "test-key" });
+globalThis.fetch = async (url) => {
+  if (String(url).includes("user/balance")) {
+    upstreamCalls += 1;
+    return { ok: true, json: async () => ({ balance_infos: [{ currency: "CNY", total_balance: "42.50", granted_balance: "2.50", topped_up_balance: "40.00" }] }) };
+  }
+  return { ok: true, json: async () => ({ rates: { CNY: 7.2 } }) };
+};
+const forced = await callRoute("/plugins/better-stats/balance", "?force=1");
+check("force=1 queries upstream",
+  forced.body?.status === "ok" && forced.body?.amount === 42.5 && upstreamCalls === 1,
+  JSON.stringify(forced.body));
+const forced2 = await callRoute("/plugins/better-stats/balance", "?force=1");
+check("force cooldown serves the cache (2s)",
+  forced2.body?.amount === 42.5 && upstreamCalls === 1,
+  "upstreamCalls=" + upstreamCalls);
+const cached2 = await callRoute("/plugins/better-stats/balance");
+check("plain balance reuses the fresh cache",
+  cached2.body?.amount === 42.5 && upstreamCalls === 1,
+  "upstreamCalls=" + upstreamCalls);
+ctx.credentials.resolve = realResolve;
+globalThis.fetch = realFetch;
+
 // Re-apply with custom tiers: routes re-register (Map upsert), the new
 // config must win; tiers can also be disabled with 0.
 apply(ctx, { balanceWarnCny: 30, balanceCriticalCny: 0 });

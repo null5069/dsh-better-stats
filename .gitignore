@@ -2,3 +2,4 @@ node_modules/
 *.log
 .DS_Store
 HANDOFF-P0-P1.md
+docs/
