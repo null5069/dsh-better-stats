@@ -1,0 +1,17 @@
+{
+  "name": "dsh-better-stats",
+  "version": "0.1.0",
+  "description": "Better session stats strip: cost this turn / total cost / provider balance, styled like the shipped stats row, with ellipsis-truncation fixed",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}
