@@ -293,6 +293,28 @@ const KNOWN_FOLD = realFoldUsage([
   { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
 ]);
 check("known model has zero unpriced steps", KNOWN_FOLD.unpricedSteps === 0 && KNOWN_FOLD.costCny === 0.00605, JSON.stringify(KNOWN_FOLD));
+
+// In-flight usage chunks carry no model: they must attribute to the model the
+// SAME turn last settled with (the live per-model figures tick with the open
+// step instead of landing in an "unknown" bucket until the message arrives).
+const CHUNK_FOLD = realFoldUsage([
+  { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } } },
+  { type: "step/start", time: OFF_PEAK, data: { turn: 1, step: 2 } },
+  { type: "assistant/chunk", time: OFF_PEAK, data: { turn: 1, step: 2, chunk: { type: "usage", usage: { inputTokens: 500, outputTokens: 300, cacheReadTokens: 0 } } } }
+]);
+check("in-flight chunk attributes to the turn's settled model",
+  CHUNK_FOLD.byModel.get("deepseek-v4-pro") !== void 0 &&
+  CHUNK_FOLD.byModel.get("deepseek-v4-pro").usage.outputTokens === 1300 &&
+  CHUNK_FOLD.byModel.get("unknown") === void 0 &&
+  CHUNK_FOLD.unpricedSteps === 0,
+  JSON.stringify([...CHUNK_FOLD.byModel.entries()].map(([k, v]) => [k, v.usage.outputTokens])));
+// a turn with NO settled message yet still leaves the chunk unknown
+const CHUNK_FOLD2 = realFoldUsage([
+  { type: "assistant/chunk", time: OFF_PEAK, data: { turn: 9, step: 1, chunk: { type: "usage", usage: { inputTokens: 500, outputTokens: 300, cacheReadTokens: 0 } } } }
+]);
+check("first-ever chunk of a turn stays unknown",
+  CHUNK_FOLD2.byModel.get("unknown") !== void 0 && CHUNK_FOLD2.unpricedSteps === 1,
+  JSON.stringify([...CHUNK_FOLD2.byModel.keys()]));
 const REASON_FOLD = realFoldUsage([
   { type: "assistant/message", time: OFF_PEAK, data: { turn: 1, step: 1, usage: { inputTokens: 0, outputTokens: 1000, cacheReadTokens: 0, reasoningTokens: 2000 }, message: { source: { model: "deepseek-v4-flash" } } } }
 ]);

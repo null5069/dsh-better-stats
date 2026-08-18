@@ -8,7 +8,7 @@ DeepSeek 官方 | 余额 ¥8.67 | 本轮 ¥0.1676 · 会话 ¥29.49 | 20 轮 · 
 
 ## 功能
 
-- **余额**：host 直连 `api.deepseek.com/user/balance`（DEEPSEEK_API_KEY 走 DSH credentials seam，key 不进入浏览器），15s 缓存刷新；悬浮层显示**赠送/充值拆分**（字段缺失时优雅降级为总额）、**可用天数估算**（按今日消耗与历史日均 EWMA 平滑）与低余额时的**充值链接**；**点击余额组可强刷**（host 端 2s 冷却防刷）
+- **余额**：host 直连 `api.deepseek.com/user/balance`（DEEPSEEK_API_KEY 走 DSH credentials seam，key 不进入浏览器），15s 缓存刷新；**点击余额组可强制刷新**（切换模型/API 后余额不会自动更新，点击即穿透缓存直查，host 端 2s 冷却防刷）；悬浮层显示**赠送/充值拆分**（字段缺失时优雅降级为总额）、**可用天数估算**（按今日消耗与历史日均 EWMA 平滑）与低余额时的**充值链接**
 - **计价口径**：输入（未命中/缓存命中）与输出按官方价目；**reasoning token 按输出价计费**（usage.reasoningTokens 单独统计并计入成本，host 与客户端一致）
 - **消费**：官方 CNY 价目表（[api-docs.deepseek.com/zh-cn/quick_start/pricing](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)），**host 每 6h 自动抓取解析同步**（失败回退内置价目；浮窗独立「价源」栏显示来源与更新时间，如 `价源 DeepSeek 官方 2026-08-18 14:16`）；**峰谷分时段**（高峰 = 北京 9:00-12:00 / 14:00-18:00，价格两倍），**按每条消息的 model 分账**（deepseek-v4-flash / deepseek-v4-pro 各用各的价目）
 - **未知模型显式标记**：检测不到的模型不再静默按 flash 计价——token 照常汇总但**不计价**，会话金额前缀 `≈`，悬浮层注明「含 N 步未定价 · 模型未知」
@@ -19,6 +19,7 @@ DeepSeek 官方 | 余额 ¥8.67 | 本轮 ¥0.1676 · 会话 ¥29.49 | 20 轮 · 
 - **余额告警（两档，默认 ≤¥20 琥珀 / ≤¥5 红色）**：余额组变色加 `⚠`，悬浮层提示，红色档附**充值链接**（跳官方充值页）；`config: { balanceWarnCny, balanceCriticalCny }` 调整阈值，对应档设 `0` 关闭
 - **峰谷栏**：独立「峰谷」组常驻显示当前时段与下次切换（如 `高峰中 · 空闲 14:00 开始`），悬浮层显示详情（`高峰中（价格×2） · 空闲 14:00 开始（3h 20m 后）`，每秒随 /live 轮询刷新）
 - **实时计时**：LLM/工具耗时在步骤进行中每秒跳动（工具相位以模型工具调用决策消息为起点，host 侧 fold 完整日志）；有数据时显示首 token 平均耗时与解码速率
+- **实时浮窗**：悬浮面板内所有可实时值（本轮/会话金额、Tok 分组与分模型行、耗时、缓存、轮次）随事件流与 250ms 心跳实时跳动（会话运行时）；**模型占比与「会话」行同源计算**（分子分母取同一份合计，永不超过 100%）；**子代理拼接的转写不会劫持父轮次的模型归属**（估算与 usage chunk 始终落在父轮次自己的模型上）；轮次一开始即显示「1 步」；终止后本轮行保留显示
 - **布局**：宽度与输入框（composer）一致、不超过对话框；换行时自动删除被拆到行首/行尾的孤立分隔符；**最多两行**，内容按顺序排列，放不下的部分落入末尾 `⋯`（latex \cdots 样式）；省略决策基于缓存的自然宽度，与渲染状态无关，不会闪烁振荡；Token 组拆为「缓存命中」「输入输出」两组
 - **浮窗**：label 列对齐；**运行中本轮括号常驻**（`本轮 ¥0.0364（精确 ¥0.0364 + 估算 ¥0.0000）`，步间估算为 0 也不闪）；**会话为单一数字**（历史+本轮一起跳动，无分账括号）；峰谷行内仅 `高峰中/空闲中`，详情在浮窗
 - **i18n**：界面文案跟随浏览器语言（中文 / English）
@@ -57,7 +58,7 @@ ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-better-stats
 | 部分 | 文件 | 说明 |
 |---|---|---|
 | host 半身 | `lib/index.js` | `/plugins/better-stats/balance`（余额+赠送/充值拆分，15s 缓存，`?force=1` 绕过缓存且带 2s 冷却）、`/plugins/better-stats/cost`（整树用量+分模型 CNY 结算，10s 缓存）、`/plugins/better-stats/live`（实时计时状态 + 每秒成本结算 + 价目/预算载荷）、`/plugins/better-stats/today`（北京时区今日/本月全会话汇总，60s 缓存）；官方价目 6h 抓取同步 |
-| client 半身 | `lib/client.js` | `conversation.composer.dock` 槽位统计条；本轮增量计价 + 流式估算；/live 每秒轮询；预算/峰谷倒计时悬浮层；分隔符换行自适应；可用天数估算与余额强刷；i18n（中/英） |
+| client 半身 | `lib/client.js` | `conversation.composer.dock` 槽位统计条；本轮增量计价 + 流式估算；/live 每秒轮询；预算/峰谷倒计时悬浮层；分隔符换行自适应；余额点击刷新（闪烁反馈）；可用天数估算；i18n（中/英） |
 | 测试 | `test/client-regression.test.mjs`、`test/host-apply.test.mjs`、`test/host-fold.test.mjs` | 无依赖 Node 测试：`node test/client-regression.test.mjs`、`node test/host-apply.test.mjs`、`node test/host-fold.test.mjs` |
 
 所有路由响应统一携带 `pricing: { source: "official"|"builtin"|"stale", fetchedAt, tables }` 与可选 `budget`，客户端不再硬编码价目数字。
