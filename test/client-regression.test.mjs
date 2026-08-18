@@ -399,7 +399,7 @@ const HOST_TABLES = {
   const el = render(env, propsWithData);
   const text = groupTextsOf(el);
   const pop = popTextOf(el);
-  check("unknown steps mark session amount with ≈", text.indexOf("会话 ≈¥0.05") !== -1, text);
+  check("unknown steps mark session amount with ≈", text.indexOf("会话 ≈¥0.0500") !== -1, text);
   check("unpriced popover note present", pop.indexOf("含 3 步未定价 · 模型未知") !== -1, pop);
   check("builtin price-source fallback in popover", pop.indexOf("内置价目(可能过期)") !== -1, pop);
 }
@@ -426,8 +426,8 @@ const HOST_TABLES = {
   check("budget warn: ⚠ prefix at 90%", /^⚠ /.test(spendText), spendText);
   check("budget warn: amber color", !!(spendSpan && spendSpan.props.style && spendSpan.props.style.color === "#f59e0b"), JSON.stringify(spendSpan && spendSpan.props.style));
   const pop = popTextOf(el);
-  check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.00 · 日预算 ¥20.00 (90%)") !== -1, pop);
-  check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.00 · 月预算 ¥100.00 (60%)") !== -1, pop);
+  check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.0000 · 日预算 ¥20.00 (90%)") !== -1, pop);
+  check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.0000 · 月预算 ¥100.00 (60%)") !== -1, pop);
 
   // over budget → red
   const env2 = makeEnv();
