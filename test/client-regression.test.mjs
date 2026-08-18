@@ -450,7 +450,7 @@ const HOST_TABLES = {
   env.states[3] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
-  check("balance split shown in hover", pop.indexOf("余额 ¥8.6700（赠送 ¥3.2000 · 充值 ¥5.4700）") !== -1, pop);
+  check("balance split shown in hover at provider decimals", pop.indexOf("余额 ¥8.67（赠送 ¥3.20 · 充值 ¥5.47）") !== -1, pop);
   check("peak countdown line in hover", /(高峰中|空闲中).*?(高峰|空闲) \d{2}:00 开始（.+后）/.test(pop), pop);
 }
 
@@ -504,19 +504,19 @@ const HOST_TABLES = {
   const h = d.getUTCHours();
   const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
   const outP = peak ? 9.0 : 4.5;
-  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args 6 chars
-  // share the output density 2.5 (text + tool JSON)
-  const est1 = (4000 / 3.5 + 6 / 2.5) * outP / 1e6;
+  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args are
+  // {"a": (5) + 1} (2) = 7 chars, shared output density 2.5
+  const est1 = (4000 / 3.5 + 7 / 2.5) * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
   check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(4)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(4));
-  // popover: one total with the breakdown in parens (总（精确 + 估算）)
+  // popover: one total with the breakdown in parens, full 6-decimal detail
   const pop1 = popTextOf(render(env, runningProps));
   check("popover shows total with (精确 + 估算) breakdown",
-    pop1.indexOf("本轮 ¥" + est1.toFixed(4) + "（精确 ¥0.0000 + 估算 ¥" + est1.toFixed(4) + "）") !== -1,
+    pop1.indexOf("本轮 ¥" + est1.toFixed(6) + "（精确 ¥0.000000 + 估算 ¥" + est1.toFixed(6) + "）") !== -1,
     pop1);
   // stream grows (in-place push) → estimate grows (text-chunks share 2.5)
   events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
-  const est2 = (4000 / 3.5 + 6 / 2.5 + 4000 / 2.5) * outP / 1e6;
+  const est2 = (4000 / 3.5 + 7 / 2.5 + 4000 / 2.5) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
   check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(4));
   // usage chunk lands → estimate resets; the turn fold shows the EXACT step
@@ -529,8 +529,8 @@ const HOST_TABLES = {
   check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 1e-4, t3 + " expected " + step1Exact.toFixed(4));
   // popover while RUNNING: the bracket persists even with a zero estimate
   const pop3 = popTextOf(render(env, runningProps));
-  check("running keeps the 本轮 bracket (估算 ¥0.0000, no flicker)",
-    pop3.indexOf("本轮 ¥" + step1Exact.toFixed(4) + "（精确 ¥" + step1Exact.toFixed(4) + " + 估算 ¥0.0000）") !== -1,
+  check("running keeps the 本轮 bracket (估算 ¥0.000000, no flicker)",
+    pop3.indexOf("本轮 ¥" + step1Exact.toFixed(6) + "（精确 ¥" + step1Exact.toFixed(6) + " + 估算 ¥0.000000）") !== -1,
     pop3);
   // next step starts → base stays (turn fold) + carried input cost + new
   // reasoning estimate (100×miss + 5000×read at the current tier)
