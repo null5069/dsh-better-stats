@@ -323,16 +323,16 @@ check("stats line caps at two rows with ellipsis style",
       .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
   };
   const t0 = textOf(render(env, props));
-  check("本轮 baseline is 0", /本轮 ¥0\.0000/.test(t0), t0);
-  // grow usage by 1000 output tokens
-  usageState.value = { ...usageState.value, outputTokens: usageState.value.outputTokens + 1000 };
+  check("本轮 baseline is 0", /本轮 ¥0\.00/.test(t0), t0);
+  // grow usage by 100000 output tokens so the 2-decimal display can show it
+  usageState.value = { ...usageState.value, outputTokens: usageState.value.outputTokens + 100000 };
   const t1 = textOf(render(env, props));
   const d = new Date(Date.now() + 8 * 3600 * 1000);
   const h = d.getUTCHours();
   const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
   const outP = peak ? 9.0 : 4.5;
-  const expected = "本轮 ¥" + (1000 * outP / 1e6).toFixed(4);
-  check("本轮 counts only the new usage (1000 output tokens)", t1.indexOf(expected) !== -1, t1 + " expected " + expected);
+  const expected = "本轮 ¥" + (100000 * outP / 1e6).toFixed(2);
+  check("本轮 counts only the new usage (100000 output tokens)", t1.indexOf(expected) !== -1, t1 + " expected " + expected);
   // same usage again → no change (no phantom from re-pricing)
   const t2 = textOf(render(env, props));
   check("本轮 unchanged when usage unchanged", t1 === t2, t2);
@@ -399,7 +399,7 @@ const HOST_TABLES = {
   const el = render(env, propsWithData);
   const text = groupTextsOf(el);
   const pop = popTextOf(el);
-  check("unknown steps mark session amount with ≈", text.indexOf("会话 ≈¥0.0500") !== -1, text);
+  check("unknown steps mark session amount with ≈", text.indexOf("会话 ≈¥0.05") !== -1, text);
   check("unpriced popover note present", pop.indexOf("含 3 步未定价 · 模型未知") !== -1, pop);
   check("builtin price-source fallback in popover", pop.indexOf("内置价目(可能过期)") !== -1, pop);
 }
@@ -426,8 +426,8 @@ const HOST_TABLES = {
   check("budget warn: ⚠ prefix at 90%", /^⚠ /.test(spendText), spendText);
   check("budget warn: amber color", !!(spendSpan && spendSpan.props.style && spendSpan.props.style.color === "#f59e0b"), JSON.stringify(spendSpan && spendSpan.props.style));
   const pop = popTextOf(el);
-  check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.0000 · 日预算 ¥20.0000 (90%)") !== -1, pop);
-  check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.0000 · 月预算 ¥100.0000 (60%)") !== -1, pop);
+  check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.00 · 日预算 ¥20.00 (90%)") !== -1, pop);
+  check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.00 · 月预算 ¥100.00 (60%)") !== -1, pop);
 
   // over budget → red
   const env2 = makeEnv();
@@ -508,7 +508,7 @@ const HOST_TABLES = {
   // {"a": (5) + 1} (2) = 7 chars, shared output density 2.5
   const est1 = (4000 / 3.5 + 7 / 2.5) * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
-  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(4)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(4));
+  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(2)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(2));
   // popover: one total with the breakdown in parens, full 6-decimal detail
   const pop1 = popTextOf(render(env, runningProps));
   check("popover shows total with (精确 + 估算) breakdown",
@@ -518,7 +518,7 @@ const HOST_TABLES = {
   events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
   const est2 = (4000 / 3.5 + 7 / 2.5 + 4000 / 2.5) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
-  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(4));
+  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(2)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(2));
   // usage chunk lands → estimate resets; the turn fold shows the EXACT step
   // cost (no (估) marker). The assistant/message (which carries the model)
   // follows in the real stream and corrects the fold's price.
@@ -526,7 +526,7 @@ const HOST_TABLES = {
   events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 }, message: { source: { model: "deepseek-v4-flash" } } } });
   const step1Exact = (100 * (peak ? 3.0 : 1.5) + 5000 * (peak ? 0.1 : 0.05) + 8000 * outP) / 1e6;
   const t3 = groupTextsOf(render(env, runningProps));
-  check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 1e-4, t3 + " expected " + step1Exact.toFixed(4));
+  check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 0.0051, t3 + " expected " + step1Exact.toFixed(2));
   // popover while RUNNING: the bracket persists even with a zero estimate
   const pop3 = popTextOf(render(env, runningProps));
   check("running keeps the 本轮 bracket (估算 ¥0.000000, no flicker)",
@@ -546,7 +546,7 @@ const HOST_TABLES = {
   const inputCny = (100 * missP + 5000 * readP) / 1e6;
   const est4 = step1Exact + inputCny + 700 / 3.5 * outP2 / 1e6;
   const t4 = groupTextsOf(render(env, runningProps));
-  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") === -1 && Math.abs(cnyOf(t4) - est4) < 1e-4, t4 + " expected " + est4.toFixed(4));
+  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") === -1 && Math.abs(cnyOf(t4) - est4) < 0.0051, t4 + " expected " + est4.toFixed(2));
   // 会话 ticks live as ONE number (历史+本轮), no breakdown bracket
   const sessEst = inputCny + 200 * outP2 / 1e6;
   const sessShown = 0.05 + sessEst;
@@ -592,19 +592,19 @@ const HOST_TABLES = {
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const turn1Shown = step1 + inputCarry + 200 * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
-  check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") === -1 && Math.abs(cnyOf(t1) - turn1Shown) < 1e-4, t1 + " expected " + turn1Shown.toFixed(4));
+  check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") === -1 && Math.abs(cnyOf(t1) - turn1Shown) < 0.0051, t1 + " expected " + turn1Shown.toFixed(2));
   // turn 1 completes → 本轮 KEEPS the final turn cost on display
   events.push({ type: "step/end", data: { turn: 1, step: 2 } });
   events.push({ type: "turn/end", data: { turn: 1 } });
   const tEnd = groupTextsOf(render(env, runningProps));
-  check("turn/end keeps the final turn cost (no reset to 0)", Math.abs(cnyOf(tEnd) - step1) < 1e-4 && tEnd.indexOf("(估)") === -1, tEnd + " expected " + step1.toFixed(4));
+  check("turn/end keeps the final turn cost (no reset to 0)", Math.abs(cnyOf(tEnd) - step1) < 0.0051 && tEnd.indexOf("(估)") === -1, tEnd + " expected " + step1.toFixed(2));
   // next turn starts → base resets; only estimate + carried input remain
   events.push({ type: "turn/start", data: { turn: 2 } });
   events.push({ type: "step/start", data: { turn: 2, step: 1 } });
   events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["c".repeat(700)] } });
   const turn2Shown = inputCarry + 200 * outP / 1e6; // fold reset; only estimate + carried input
   const t2 = groupTextsOf(render(env, runningProps));
-  check("turn/start resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") === -1 && Math.abs(cnyOf(t2) - turn2Shown) < 1e-4, t2 + " expected " + turn2Shown.toFixed(4));
+  check("turn/start resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") === -1 && Math.abs(cnyOf(t2) - turn2Shown) < 0.0051, t2 + " expected " + turn2Shown.toFixed(2));
   // restored-session history (pre-loaded events without a turn/start) never
   // leaks into 本轮 before the first turn boundary
   const histEvents = [
@@ -616,7 +616,7 @@ const HOST_TABLES = {
   const envH = makeEnv();
   envH.states[17] = env.states[17];
   const tH = groupTextsOf(render(envH, runningProps));
-  check("pre-loaded history stays out of 本轮 (fold starts at turn/start)", /本轮 ¥0\.0000/.test(tH) && tH.indexOf("(估)") === -1, tH);
+  check("pre-loaded history stays out of 本轮 (fold starts at turn/start)", /本轮 ¥0\.00/.test(tH) && tH.indexOf("(估)") === -1, tH);
 }
 
 // Scenario 19: two-tier low-balance alert — amber ≤ warn (default ¥20),
@@ -650,14 +650,14 @@ const HOST_TABLES = {
   const warnSpan = balSpanOf(elWarn);
   const warnText = (warnSpan && warnSpan.children || []).join("");
   check("balance ≤ warn → amber ⚠", /^⚠ /.test(warnText) && warnSpan.props.style.color === "#f59e0b", warnText + " " + JSON.stringify(warnSpan && warnSpan.props.style));
-  check("amber alert line in hover", popTextOf(elWarn).indexOf("余额告警：低于 ¥20.0000（琥珀）") !== -1, popTextOf(elWarn));
+  check("amber alert line in hover", popTextOf(elWarn).indexOf("余额告警：低于 ¥20.00（琥珀）") !== -1, popTextOf(elWarn));
 
   // 4 ≤ 5 → red critical
   const elCrit = renderWith(4, defaults);
   const critSpan = balSpanOf(elCrit);
   const critText = (critSpan && critSpan.children || []).join("");
   check("balance ≤ critical → red ⚠", /^⚠ /.test(critText) && critSpan.props.style.color === "#ef4444", critText + " " + JSON.stringify(critSpan && critSpan.props.style));
-  check("red alert line in hover", popTextOf(elCrit).indexOf("余额告警：低于 ¥5.0000（红色）") !== -1, popTextOf(elCrit));
+  check("red alert line in hover", popTextOf(elCrit).indexOf("余额告警：低于 ¥5.00（红色）") !== -1, popTextOf(elCrit));
 
   // 25 > 20 → no alert
   const elOk = renderWith(25, defaults);
@@ -709,7 +709,7 @@ const HOST_TABLES = {
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const expected = step1Exact + inputCarry + 700 / adaptedDensity * outP / 1e6;
   const t = groupTextsOf(render(env, runningProps));
-  check("densities adapt after a settled step (EMA)", t.indexOf("(估)") === -1 && Math.abs(cnyOf(t) - expected) < 1e-4, t + " expected " + expected.toFixed(4));
+  check("densities adapt after a settled step (EMA)", t.indexOf("(估)") === -1 && Math.abs(cnyOf(t) - expected) < 0.0051, t + " expected " + expected.toFixed(2));
 }
 
 // Scenario 21: two-row layout with MID-ellipsis — when the natural-width
@@ -792,8 +792,8 @@ const HOST_TABLES = {
   const step1 = (100 * missP + 500 * readP + 4200 * outP) / 1e6;
   const t = groupTextsOf(render(env, runningProps));
   check("first-step exact fold is priced (精确 not stuck at 0)",
-    Math.abs(cnyOf(t) - step1) < 1e-4 && t.indexOf("本轮 ¥" + step1.toFixed(4)) !== -1,
-    t + " expected " + step1.toFixed(4));
+    Math.abs(cnyOf(t) - step1) < 0.0051 && t.indexOf("本轮 ¥" + step1.toFixed(2)) !== -1,
+    t + " expected " + step1.toFixed(2));
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
