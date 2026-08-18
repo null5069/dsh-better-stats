@@ -1,6 +1,6 @@
 {
   "name": "dsh-better-stats",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Enhanced DSH composer stats strip: official CNY cost (peak/off-peak, per-model), real-time settlement, live LLM/tool timers, provider balance, subagent tree merge",
   "license": "MIT",
   "type": "module",
