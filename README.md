@@ -35,7 +35,7 @@ pnpm add dsh-better-stats
 ### 方式二：GitHub 克隆
 
 ```bash
-git clone https://github.com/hanshushao123/dsh-better-stats.git
+git clone https://github.com/null5069/dsh-better-stats.git
 cd dsh-better-stats          # 无运行时依赖，不需要 npm install
 
 ln -s "$PWD" ~/.dsh/profiles/web/node_modules/dsh-better-stats
