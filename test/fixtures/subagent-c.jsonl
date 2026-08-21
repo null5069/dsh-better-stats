@@ -1,0 +1,5 @@
+{"version":0,"id":"session-subagent-c","createdAt":1787030000000,"parentSession":"session-root","origin":"subagent","delegationDepth":1}
+{"type":"turn/start","time":1787030900000,"data":{"turn":1}}
+{"type":"step/start","time":1787030900000,"data":{"turn":1,"step":1}}
+{"type":"assistant/message","time":1787031000000,"data":{"turn":1,"step":1,"usage":{"inputTokens":100,"outputTokens":700,"reasoningTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0},"message":{"source":{"model":"deepseek-v4-pro"}}}}
+{"type":"step/end","time":1787031000000,"data":{"turn":1,"step":1}}

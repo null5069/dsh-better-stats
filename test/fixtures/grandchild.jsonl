@@ -1,0 +1,3 @@
+{"version":0,"id":"session-grandchild","createdAt":1787032000000,"parentSession":"session-subagent-a","origin":"subagent","delegationDepth":2,"seedLength":1}
+{"type":"turn/start","time":1787032490000,"data":{"turn":1}}
+{"type":"assistant/message","time":1787032510000,"data":{"turn":1,"step":1,"usage":{"inputTokens":10,"outputTokens":500,"reasoningTokens":0,"cacheReadTokens":0,"cacheWriteTokens":0},"message":{"source":{"model":"deepseek-v4-pro"}}}}

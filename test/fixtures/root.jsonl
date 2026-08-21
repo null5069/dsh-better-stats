@@ -1,0 +1,13 @@
+{"version":0,"id":"session-root","createdAt":1787000000000,"cwd":"/fake/workspace"}
+{"type":"turn/start","time":1787025600000,"data":{"turn":1}}
+{"type":"step/start","time":1787025600000,"data":{"turn":1,"step":1}}
+{"type":"assistant/chunk","time":1787025610000,"data":{"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":1000,"outputTokens":1000,"reasoningTokens":600,"cacheReadTokens":2000,"cacheWriteTokens":0}}}}
+{"type":"assistant/message","time":1787025610000,"data":{"turn":1,"step":1,"usage":{"inputTokens":1000,"outputTokens":1000,"reasoningTokens":600,"cacheReadTokens":2000,"cacheWriteTokens":0},"message":{"source":{"model":"deepseek-v4-flash"}}}}
+{"type":"step/end","time":1787025610000,"data":{"turn":1,"step":1}}
+{"type":"turn/end","time":1787025610000,"data":{"turn":1}}
+{"type":"turn/start","time":1787036400000,"data":{"turn":2}}
+{"type":"step/start","time":1787036400000,"data":{"turn":2,"step":1}}
+{"type":"assistant/chunk","time":1787036410000,"data":{"turn":2,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":2000,"outputTokens":5000,"reasoningTokens":3000,"cacheReadTokens":3000,"cacheWriteTokens":500}}}}
+{"type":"assistant/message","time":1787036410000,"data":{"turn":2,"step":1,"usage":{"inputTokens":2000,"outputTokens":5000,"reasoningTokens":3000,"cacheReadTokens":3000,"cacheWriteTokens":500},"message":{"source":{"model":"deepseek-v4-pro"}}}}
+{"type":"step/end","time":1787036410000,"data":{"turn":2,"step":1}}
+{"type":"turn/end","time":1787036410000,"data":{"turn":2}}

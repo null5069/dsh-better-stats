@@ -1,6 +1,9 @@
 // Cordis host-entry smoke test. In real DSH, plugin configuration is passed as
 // apply(ctx, config); ctx.config is an injected service accessor and reading it
 // without declaring an injection aborts the whole plugin tree.
+// Covers: route registration, balance schema (ok/stale/error — one shape),
+// singleflight concurrency, cost snapshot shape (root/descendants/partial),
+// the legal costCny === 0, and the removal of the USD/CNY third-party rate.
 import { apply } from "../lib/index.js";
 
 let failures = 0;
@@ -17,7 +20,7 @@ const ctx = {
   credentials: { resolve: async () => null },
   sessions: {
     list: () => [],
-    get: (id) => id === "session-smoke" ? { events: [] } : void 0,
+    get: (id) => id === "session-smoke" ? { events: [], header: { id: "session-smoke" } } : void 0,
   },
   webServer: {
     register(route) {
@@ -39,11 +42,11 @@ apply(ctx, { dailyBudgetCny: 20, monthlyBudgetCny: 100 });
 check("host apply does not read uninjected ctx.config", true);
 check("all host routes register", routes.size === 4, JSON.stringify([...routes.keys()]));
 
-// Deterministic rate source: /balance's usdCnyRate must not hit the network.
-globalThis.fetch = async () => ({
-  ok: true,
-  json: async () => ({ rates: { CNY: 7.2 } }),
-});
+// No third-party rate endpoint may be touched anymore: /balance needs only
+// the provider upstream.
+globalThis.fetch = async () => {
+  throw new Error("unexpected fetch — the USD/CNY rate sources were removed");
+};
 
 async function callRoute(path, query = "") {
   return new Promise((resolve) => {
@@ -70,14 +73,25 @@ check(
 check("balance alert defaults to two tiers (warn 20 / critical 5)",
   live.body?.budget?.balanceWarnCny === 20 && live.body?.budget?.balanceCriticalCny === 5,
   JSON.stringify(live.body?.budget));
-check("live route carries pricing + unpricedSteps",
-  live.body?.pricing?.source === "builtin" && live.body?.unpricedSteps === 0,
-  JSON.stringify({ pricing: live.body?.pricing, unpricedSteps: live.body?.unpricedSteps }));
+check("live route carries pricing + rootCostCny + invalidSteps",
+  live.body?.pricing?.source === "builtin" && live.body?.rootCostCny === 0 &&
+  live.body?.unpricedSteps === 0 && live.body?.invalidSteps === 0,
+  JSON.stringify({ pricing: live.body?.pricing, rootCostCny: live.body?.rootCostCny }));
 
 const cost = await callRoute("/plugins/better-stats/cost", "?sessionId=session-smoke");
-check("cost route responds for an empty session",
+check("cost route responds for an empty session (legal costCny === 0)",
   cost.status === 200 && cost.body?.costCny === 0 && cost.body?.descendantCount === 0,
-  JSON.stringify(cost));
+  JSON.stringify({ status: cost.status, costCny: cost.body?.costCny }));
+check("cost route carries the root/descendants split",
+  cost.body?.root?.costCny === 0 && cost.body?.descendants?.costCny === 0 &&
+  Array.isArray(cost.body?.models) && cost.body?.merged?.outputTokens === 0,
+  JSON.stringify({ root: cost.body?.root, desc: cost.body?.descendants }));
+check("cost route accounting fields",
+  cost.body?.partial === false && cost.body?.failedSessionCount === 0 &&
+  cost.body?.persistenceAvailable === false && cost.body?.foldedSessionCount === 1 &&
+  typeof cost.body?.pricingVersion === "number" && typeof cost.body?.eventRevision === "number" &&
+  typeof cost.body?.queriedAt === "string",
+  JSON.stringify({ partial: cost.body?.partial, persistenceAvailable: cost.body?.persistenceAvailable }));
 check("cost route carries pricing + budget",
   cost.body?.pricing?.source === "builtin" && cost.body?.budget?.daily === 20,
   JSON.stringify({ pricing: cost.body?.pricing, budget: cost.body?.budget }));
@@ -89,15 +103,16 @@ check("today route responds with zero spend",
 check("today route reports the Beijing date", /^\d{4}-\d{2}-\d{2}$/.test(today.body?.date ?? ""), today.body?.date);
 
 const balance = await callRoute("/plugins/better-stats/balance");
-check("balance route degrades without a key",
-  balance.status === 200 && balance.body?.configured === false && balance.body?.usdCnyRate === 7.2,
-  JSON.stringify(balance));
+check("balance route degrades without a key (status ok, unified schema)",
+  balance.status === 200 && balance.body?.configured === false && balance.body?.status === "ok" &&
+  balance.body?.amount === null && balance.body?.currency === null &&
+  balance.body?.usdCnyRate === void 0,
+  JSON.stringify(balance.body));
 
-// Force-refresh path: ?force=1 bypasses the cache, with a 2s anti-flood
-// cooldown between forced queries. Swap in a key + balance-shaped upstream
-// and count upstream calls.
+// Force-refresh path with singleflight: two CONCURRENT first misses must share
+// ONE upstream query; ?force=1 bypasses the cache with a 2s anti-flood
+// cooldown between forced queries.
 const realResolve = ctx.credentials.resolve;
-const realFetch = globalThis.fetch;
 let upstreamCalls = 0;
 ctx.credentials.resolve = async () => ({ value: "test-key" });
 globalThis.fetch = async (url) => {
@@ -105,22 +120,33 @@ globalThis.fetch = async (url) => {
     upstreamCalls += 1;
     return { ok: true, json: async () => ({ balance_infos: [{ currency: "CNY", total_balance: "42.50", granted_balance: "2.50", topped_up_balance: "40.00" }] }) };
   }
-  return { ok: true, json: async () => ({ rates: { CNY: 7.2 } }) };
+  throw new Error("unexpected fetch " + url);
 };
+{
+  const [a, b] = await Promise.all([
+    callRoute("/plugins/better-stats/balance"),
+    callRoute("/plugins/better-stats/balance"),
+  ]);
+  check("concurrent first balance requests share ONE upstream call (singleflight)",
+    a.body?.status === "ok" && b.body?.status === "ok" && a.body?.amount === 42.5 &&
+    upstreamCalls === 1,
+    `upstreamCalls=${upstreamCalls}`);
+}
 const forced = await callRoute("/plugins/better-stats/balance", "?force=1");
 check("force=1 queries upstream",
-  forced.body?.status === "ok" && forced.body?.amount === 42.5 && upstreamCalls === 1,
+  forced.body?.status === "ok" && forced.body?.amount === 42.5 && upstreamCalls === 2,
   JSON.stringify(forced.body));
 const forced2 = await callRoute("/plugins/better-stats/balance", "?force=1");
-check("force cooldown serves the cache (2s)",
-  forced2.body?.amount === 42.5 && upstreamCalls === 1,
-  "upstreamCalls=" + upstreamCalls);
+check("force cooldown serves the cache as status stale (same schema)",
+  forced2.body?.status === "stale" && forced2.body?.configured === true &&
+  forced2.body?.amount === 42.5 && forced2.body?.provider === "deepseek-official" &&
+  typeof forced2.body?.queriedAt === "string" && upstreamCalls === 2,
+  JSON.stringify(forced2.body));
 const cached2 = await callRoute("/plugins/better-stats/balance");
 check("plain balance reuses the fresh cache",
-  cached2.body?.amount === 42.5 && upstreamCalls === 1,
+  cached2.body?.status === "ok" && cached2.body?.amount === 42.5 && upstreamCalls === 2,
   "upstreamCalls=" + upstreamCalls);
 ctx.credentials.resolve = realResolve;
-globalThis.fetch = realFetch;
 
 // Re-apply with custom tiers: routes re-register (Map upsert), the new
 // config must win; tiers can also be disabled with 0.

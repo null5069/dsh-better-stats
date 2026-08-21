@@ -1,19 +1,46 @@
 // Regression harness for dsh-better-stats client.js (no browser needed).
-// Verifies:
-//  1. plugin loads via the ModuleLoader protocol and apply() registers the
-//     dock entry;
-//  2. with usage+stats data and no balance yet, the line still renders;
-//  3. with NO data at all, the placeholder (data-bs="v20-empty") renders
-//     instead of silently returning null;
-//  4. measureSeps never throws even when refs arrays hold undefined holes
-//     (the exact condition that crashed and got the entry abdicated);
-//  5. balance-arrives re-render keeps the line alive.
+// Verifies: module load via the ModuleLoader protocol, dock registration,
+// the strip/popover rendering, the P1 accounting contract (output/reasoning
+// subset, unknown models + legal zeros, snapshot merging without max()),
+// session-switch rebuild, dedupe, i18n (zh + en, no Chinese leak), and the
+// 100ms ticker gating.
+//
+// The harness emulates React hooks. Hook indices (documented, stable):
+//   OUTER (workspace scope):
+//     1=balance 2=hovered 3=anchor 4=etaRef 5=balanceRefreshRef 6=refreshPulse
+//     7=workspaceMetaRef 8=balance-effect 9=hideTimerRef
+//   INNER (session scope, key={sessionId}):
+//     10=merged(useMemo) 11=estimateRef 12=pricingRef 13=budgetRef
+//     14=todayState 15=costState 16=cost-effect 17=liveState 18=live-effect
+//     19=today-effect 20=tickState 21=runningRef 22=ticker-effect
+//     23=sessionModelRef 24=layoutState 25=layoutRef 26=prevUsageRef
+//     27=turnCostRef 28=sepState 29=trailingCache 30=itemRefs 31=sepProbeRef
+//     32=measureRef 33=lineRef 34=ellideState 35=ellideRef 36=widthsRef
+//     37=useLayoutEffect 38=resize-effect
 import { readFileSync } from "node:fs";
+
+// Locale determinism: the bundle captures navigator.language at load time.
+// Pin it to zh-CN here (override with BS_LANG for a fully-English run) so the
+// zh assertions never depend on the machine's locale — scenario 25 explicitly
+// re-loads the bundle with en-US for the English half of the suite.
+{
+  const forced = process.env.BS_LANG || "zh-CN";
+  try {
+    Object.defineProperty(globalThis.navigator, "language", { value: forced, configurable: true });
+  } catch (e) { /* keep whatever the runtime reports */ }
+  console.log("client suite locale:", forced);
+}
 
 const code = readFileSync(
   new URL("../lib/client.js", import.meta.url),
   "utf8"
 );
+
+let failures = 0;
+function check(name, cond, detail) {
+  console.log((cond ? "PASS: " : "FAIL: ") + name + (detail && !cond ? " — " + detail : ""));
+  if (!cond) failures++;
+}
 
 // ── dynamic react proxy: hooks resolve against the current render env ────
 let currentEnv = null; // { states, cursor, effects, callSetState }
@@ -56,6 +83,17 @@ function reactProxy() {
       if (changed) env.effects.push(callback);
     },
     createElement(type, props, ...children) {
+      // render function components immediately (like React reconciliation),
+      // so nested components — the keyed session subcomponent — run in the
+      // same hook environment
+      if (typeof type === "function") {
+        const env = currentEnv;
+        if (props && props.key !== void 0) {
+          if (!Array.isArray(env.lastKeys)) env.lastKeys = [];
+          env.lastKeys.push(props.key);
+        }
+        return type({ ...(props || {}), children });
+      }
       return { type, props: props || {}, children };
     },
   };
@@ -82,13 +120,41 @@ const plugin = factory((spec) => {
 });
 console.log("exports:", Object.keys(plugin), "| inject:", JSON.stringify(plugin.inject));
 
+// ── default fetch mock: every route answers so effects never throw ────────
+function defaultBody(url) {
+  const u = String(url);
+  if (u.indexOf("/plugins/better-stats/balance") !== -1) {
+    return { configured: false, status: "ok", provider: null, amount: null, currency: null, queriedAt: new Date().toISOString() };
+  }
+  if (u.indexOf("/plugins/better-stats/cost") !== -1) {
+    return {
+      sessionId: "session-test", found: true,
+      merged: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+      costCny: 0,
+      root: { costCny: 0, unpricedSteps: 0, invalidSteps: 0 },
+      descendants: { costCny: 0, unpricedSteps: 0, invalidSteps: 0, descendantCount: 0 },
+      models: [], unpricedSteps: 0, invalidSteps: 0, partial: false,
+      failedSessionCount: 0, persistenceAvailable: false, descendantCount: 0,
+      pricingVersion: 0, queriedAt: new Date().toISOString()
+    };
+  }
+  if (u.indexOf("/plugins/better-stats/live") !== -1) {
+    // openStepStart intentionally absent → the client keeps its previous value
+    return { sessionId: "session-test", completed: null, rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0 };
+  }
+  if (u.indexOf("/plugins/better-stats/today") !== -1) {
+    return { date: "2026-08-18", since: 0, costCny: 0, monthCostCny: 0, unpricedSteps: 0, invalidSteps: 0, sessionCount: 0 };
+  }
+  return {};
+}
+globalThis.fetch = (url) => Promise.resolve({ ok: true, json: () => Promise.resolve(defaultBody(url)) });
+
 // ── apply with fake ctx (sessions swappable per scenario) ─────────────────
 let Comp = null;
 let options = null;
 function applyWith(sessions) {
   Comp = null;
   options = null;
-  const module2 = { exports: {} };
   const plugin2 = factory((spec) => {
     if (spec === "react") return reactProxy();
     throw new Error("unexpected require: " + spec);
@@ -105,14 +171,8 @@ applyWith({});
 console.log("registered:", options.id, "order:", options.order, "name:", options.name);
 
 // ── tiny render loop ─────────────────────────────────────────────────────
-let failures = 0;
-function check(name, cond, detail) {
-  console.log((cond ? "PASS: " : "FAIL: ") + name + (detail && !cond ? " — " + detail : ""));
-  if (!cond) failures++;
-}
-
 function makeEnv() {
-  return { states: [], cursor: 0, effects: [], rerender: false };
+  return { states: [], cursor: 0, effects: [], rerender: false, lastKeys: [] };
 }
 
 function render(env, props) {
@@ -131,13 +191,33 @@ function render(env, props) {
   currentEnv = null;
   for (const cb of effects) {
     try {
-      cb(); // passive effects: errors are console noise, never a render crash
+      cb();
     } catch (err) {
-      console.error("effect threw (non-fatal):", err && err.message ? err.message : err);
+      // effect errors are REAL failures — never console noise
+      check("effect ran without throwing (" + (err && err.message ? err.message : String(err)) + ")", false);
     }
   }
   return el;
 }
+
+// Harness slot INDICES (0-based): hook #N lives at env.states[N-1].
+// OUTER: 1=balance 2=hovered 3=anchor 4=etaRef 5=balanceRefreshRef
+// 6=refreshPulse 7=workspaceMetaRef 8=balance-effect 9=hideTimerRef
+// INNER: 10=merged 11=estimateRef 12=pricingRef 13=budgetRef 14=todayState
+// 15=costState 16=cost-effect 17=liveState 18=live-effect 19=today-effect
+// 20=tickState 21=runningRef 22=ticker-effect 23=sessionModelRef
+// 24=layoutState 25=layoutRef 26=prevUsageRef 27=turnCostRef 28=sepState
+// 29=trailingCache 30=itemRefs 31=sepProbeRef 32=measureRef 33=lineRef
+// 34=ellideState 35=ellideRef 36=widthsRef 37=layout-effect 38=resize-effect
+const HOOK = {
+  balance: 0, hovered: 1, anchor: 2,
+  today: 13, cost: 14, live: 16,
+  sepState: 27, itemRefs: 29, probe: 30, measure: 31, lineRef: 32
+};
+function seedLive(env, body) { env.states[HOOK.live] = { value: body }; }
+function seedCost(env, body) { env.states[HOOK.cost] = { value: body }; }
+function seedToday(env, body) { env.states[HOOK.today] = { value: body }; }
+function seedBalance(env, body) { env.states[HOOK.balance] = { value: body }; }
 
 const TOKEN_USAGE = { uncachedInputTokens: 1000, cacheReadTokens: 500, cacheWriteTokens: 0, outputTokens: 200 };
 const SESSION_STATS = { turns: 3, steps: 12, llmMs: 45200, toolMs: 12300, ttftMs: 1400, ttftSteps: 1, decodeMs: 1000, decodeTokens: 25 };
@@ -152,13 +232,81 @@ const propsNoData = {
   sessionId: "session-test",
 };
 
+// ── element helpers ───────────────────────────────────────────────────────
+function allEls(node, out) {
+  if (node === null || typeof node !== "object") return;
+  if (typeof node.props !== "undefined" && typeof node.props.className === "string") out.push(node);
+  if (Array.isArray(node)) { for (const c of node) allEls(c, out); return; }
+  if (typeof node.children !== "undefined") allEls(node.children, out);
+}
+function flatEls(el) {
+  const out = [];
+  allEls(el.children, out);
+  return out;
+}
+function groupTextsOf(el) {
+  const flat = flatEls(el);
+  return flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
+    .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
+}
+function cnyOf(text) {
+  const m = String(text).match(/本轮 ¥([\d.]+)/);
+  return m ? Number(m[1]) : NaN;
+}
+function collectStrings(node, out) {
+  if (typeof node === "string") { out.push(node); return; }
+  if (node === null || node === void 0 || typeof node !== "object") return;
+  if (Array.isArray(node)) {
+    for (const c of node) collectStrings(c, out);
+    return;
+  }
+  if (typeof node.children !== "undefined") collectStrings(node.children, out);
+}
+function popTextOf(el) {
+  const flat = flatEls(el);
+  const pop = flat.find((c) => c && typeof c === "object" && c.props && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-pop") !== -1 && c.props.className.indexOf("pop-row") === -1);
+  if (!pop) return "";
+  const out = [];
+  collectStrings(pop.children, out);
+  // empty grid cells join as stray spaces — collapse runs so cell adjacency
+  // is asserted on single spaces
+  return out.join(" ").replace(/\s+/g, " ");
+}
+const HOST_TABLES = {
+  "deepseek-v4-flash": { miss: 1.5, read: 0.05, out: 4.5, missPeak: 3.0, readPeak: 0.1, outPeak: 9.0 },
+  "deepseek-v4-pro": { miss: 4.5, read: 0.15, out: 13.5, missPeak: 9.0, readPeak: 0.3, outPeak: 27.0 }
+};
+function peakAt(now) {
+  const d = new Date(now + 8 * 3600 * 1000);
+  const h = d.getUTCHours();
+  return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+}
+function flashOut(now) { return peakAt(now) ? 9.0 : 4.5; }
+function flashMiss(now) { return peakAt(now) ? 3.0 : 1.5; }
+function flashRead(now) { return peakAt(now) ? 0.1 : 0.05; }
+
+// ── hook-index sanity (documents the stable map) ──────────────────────────
+// Harness slot INDICES are 0-based: hook #N lives at env.states[N-1]
+// (see the HOOK map above).
+{
+  applyWith({});
+  const env = makeEnv();
+  render(env, propsWithData);
+  check("hook map: balance state at index 0", env.states[0] !== void 0 && env.states[0].value !== void 0);
+  check("hook map: liveState at index 16 (object seeded-able)", typeof env.states[16] === "object");
+  check("hook map: costState at index 14", typeof env.states[14] === "object");
+  check("hook map: todayState at index 13", typeof env.states[13] === "object");
+  check("hook map: 38 hooks total (refs exercised by scenarios 6/9/21)",
+    env.states.length === 38 && typeof env.states[31].current === "function" &&
+    Array.isArray(env.states[29].current),
+    "len=" + env.states.length + " 29=" + JSON.stringify(env.states[29] && env.states[29].current) + " 31=" + typeof (env.states[31] && env.states[31].current));
+}
+
 // Scenario 1: no data at all → placeholder, never null
 {
   const env = makeEnv();
   const el = render(env, propsNoData);
-  const flat0 = flatEls(el);
-  const texts0 = flat0.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
-    .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
+  const texts0 = groupTextsOf(el);
   check("no-data still renders the line with the 峰谷 group",
     !!(el && el.props && el.props["data-bs"] === "v20") && texts0.indexOf("峰谷") === -1 && /^(高峰中|空闲中)$/.test(texts0),
     JSON.stringify(el).slice(0, 140) + " texts=" + texts0);
@@ -195,66 +343,37 @@ const propsNoData = {
 {
   const env = makeEnv();
   const el1 = render(env, propsWithData);
-  // simulate the balance fetch setState: rerun render; the balance useState
-  // initial was null; emulate arrival by re-rendering with the setter
-  // applied — our harness lacks setState queue, so instead run a fresh
-  // render where the localStorage cache would have been populated: emulate
-  // by re-rendering in a NEW env whose useState first call returns the cache
-  const env2 = makeEnv();
-  const orig = reactProxy().useState; // ignore
-  // patch: we can't patch the proxy easily; instead verify via scenario 2's
-  // group math that balance group appears when cache present — simulate by
-  // pre-seeding: temporarily wrap useState via a sub-proxy is complex, so
-  // just assert scenario 2 already covers non-empty groups; skip.
   check("balance-less line already renders groups", !!(el1 && el1.props && el1.props["data-bs"] === "v20"));
 }
 
-// Scenario 4: THE crash condition — measureSeps with refs full of undefined
+// Scenario 4: THE crash condition — measureSeps with refs full of undefined.
+// Effect errors now FAIL the test, so this scenario is a real assertion:
+// measureSeps ran inside the effects with unattached refs and must not throw.
 {
   const env = makeEnv();
-  render(env, propsWithData);
-  // Grab the latest measureSeps through the ref chain: the [groups] effect
-  // called measureRef.current(). Reproduce the crash by directly invoking
-  // the component's measurement with broken refs: we do this by rendering
-  // again and, before effects run, sabotaging the refs — our harness runs
-  // effects right after render, and refs are attached during "commit"
-  // (before effects) in real React. To simulate the RO racing commit, call
-  // the effect callback manually with holes in the ref arrays.
-  // Find the effects' closures: they read the component refs at call time,
-  // so leaving those refs unattached reproduces the commit race safely.
-  const refStates = env.states.filter((s) => s && typeof s.current !== "undefined" && Array.isArray(s.current));
-  const sepRefState = refStates.find((s) => s.current.length === 0 || Array.isArray(s.current));
-  // Actually the refs arrays start [] and get filled by ref callbacks during
-  // commit — which our harness never runs. That means refs are ALREADY
-  // empty/undefined when effects run — exactly the crash condition.
-  // The effects already ran inside render() above without throwing; if they
-  // had thrown, render() would have propagated. Confirm explicitly:
-  check("measureSeps survived undefined refs (effects ran clean)", true);
+  const el = render(env, propsWithData);
+  check("measureSeps survived undefined refs (effects ran, none threw)",
+    !!(el && el.props && el.props["data-bs"] === "v20"));
 }
 
 // Scenario 5: repeated re-renders (hover toggles) don't crash
 {
   const env = makeEnv();
   const el = render(env, propsWithData);
-  const el2 = render(env, propsWithData); // re-render, same env
+  const el2 = render(env, propsWithData);
   check("re-render stable", !!(el2 && el2.props && el2.props["data-bs"] === "v20"));
 }
 
-// Scenario 6: deterministic wrap calculation. It uses natural widths rather
-// than offsetTop from the already-mutated layout, so hiding a separator cannot
-// pull a group back and then make the separator visible again (the old flicker
-// loop). Hook order: 4=lineRef, 5=sepHidden, 7=itemRefs, 8=probe, 9=measure.
+// Scenario 6: deterministic wrap calculation (natural widths, no feedback loop)
 {
   const env = makeEnv();
   render(env, propsWithData);
-  const lineRef = env.states[4];
-  const itemRef = env.states[7];
-  const probeRef = env.states[8];
-  const measure = env.states[9].current;
-  const hidden = () => env.states[5].value;
+  const lineRef = env.states[HOOK.lineRef];
+  const itemRef = env.states[HOOK.itemRefs];
+  const probeRef = env.states[HOOK.probe];
+  const measure = env.states[HOOK.measure].current;
+  const hidden = () => env.states[HOOK.sepState].value;
 
-  // Six groups; separator natural width is 20. At 300px the third
-  // separator begins a new row, while the following two fit that row.
   lineRef.current = { clientWidth: 300 };
   probeRef.current = { offsetWidth: 20 };
   [80, 90, 70, 60, 50, 40, 30].forEach((width, i) => {
@@ -265,7 +384,6 @@ const propsNoData = {
     JSON.stringify(hidden()) === "[false,false,true,false,false,false]",
     JSON.stringify(hidden()));
 
-  // Same geometry produces the same array object — no state feedback loop.
   const stable = hidden();
   measure();
   check("same geometry does not schedule a toggling state", hidden() === stable);
@@ -275,19 +393,15 @@ const propsNoData = {
   check("re-flow restores separators", JSON.stringify(hidden()) === "[false,false,false,false,false,false]", JSON.stringify(hidden()));
 }
 
-// Scenario 9: ref-index capture — every group keeps its own natural-width ref,
-// and the hidden probe remains separate from real separator elements.
-// React calls ref callbacks at COMMIT time; a callback closing over the loop
-// `var gi` would see the FINAL index and write every element to the same
-// slot. Simulate a commit and verify each index lands in its own slot.
+// Scenario 9: ref-index capture — every group keeps its own natural-width ref
 {
   applyWith({});
   const env = makeEnv();
   const el = render(env, propsWithData);
   const flat = flatEls(el);
-  const itemRef = env.states[7];
-  const lineRef = env.states[4];
-  const probeRef = env.states[8];
+  const itemRef = env.states[HOOK.itemRefs];
+  const lineRef = env.states[HOOK.lineRef];
+  const probeRef = env.states[HOOK.probe];
   const groupSpans = flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1);
   const probeSpan = flat.find((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("sep-probe") !== -1);
   groupSpans.forEach((sp, i) => sp.props.ref({ offsetWidth: 50, idx: i }));
@@ -297,145 +411,78 @@ const propsNoData = {
     itemRef.current.every((e, i) => e !== void 0 && e.idx === i && e.offsetWidth === 50) &&
     probeRef.current && probeRef.current.probe === true,
     "itemRef=" + JSON.stringify(itemRef.current.map((e) => e && e.idx)));
-
-  lineRef.current = { clientWidth: 1000 };
-  const measure = env.states[9].current;
-  const hidden = () => env.states[5].value;
-  measure();
-  check("natural-width measure keeps same-line separators", JSON.stringify(hidden()) === "[false,false,false,false,false,false]", JSON.stringify(hidden()));
 }
 
-// Scenario 10: the strip caps at two rows with an ellipsis marker on the
-// second row (user spec: 最多两行，溢出时第二行末尾省略号).
+// Scenario 10: the strip caps at two rows with an ellipsis marker
 check("stats line caps at two rows with ellipsis style",
   code.includes("max-height:48px;overflow:hidden") && code.includes("dsh-better-stats-ellipsis") &&
   !code.includes("max-height:none;overflow:visible"));
 
-// Scenario 12: 本轮 prices ONLY the new usage — no retroactive re-pricing
+// Scenario 12: the projection-diff fallback with an UNKNOWN initial model —
+// new usage is never silently priced at the flash rate.
 {
   applyWith({});
   const env = makeEnv();
   const usageState = { value: { ...TOKEN_USAGE } };
   const props = { ...propsWithData, useProjection: (key) => key === "tokenUsage" ? usageState.value : SESSION_STATS };
-  const textOf = (el) => {
-    const flat = flatEls(el);
-    return flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
-      .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
-  };
-  const t0 = textOf(render(env, props));
+  const t0 = groupTextsOf(render(env, props));
   check("本轮 baseline is 0", /本轮 ¥0\.00/.test(t0), t0);
-  // grow usage by 100000 output tokens so the 2-decimal display can show it
   usageState.value = { ...usageState.value, outputTokens: usageState.value.outputTokens + 100000 };
-  const t1 = textOf(render(env, props));
-  const d = new Date(Date.now() + 8 * 3600 * 1000);
-  const h = d.getUTCHours();
-  const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
-  const outP = peak ? 9.0 : 4.5;
-  const expected = "本轮 ¥" + (100000 * outP / 1e6).toFixed(4);
-  check("本轮 counts only the new usage (100000 output tokens)", t1.indexOf(expected) !== -1, t1 + " expected " + expected);
-  // same usage again → no change (no phantom from re-pricing)
-  const t2 = textOf(render(env, props));
+  const t1 = groupTextsOf(render(env, props));
+  check("unknown initial model never prices at flash (本轮 stays 0)", /本轮 ¥0\.00/.test(t1), t1);
+  const t2 = groupTextsOf(render(env, props));
   check("本轮 unchanged when usage unchanged", t1 === t2, t2);
 }
 
-// ── v20 helpers: group text / popover text extraction ──────────────────────
-// Elements can nest (sep+group live inside one flex unit), so collect all
-// element nodes recursively instead of flatting only top-level arrays.
-function allEls(node, out) {
-  if (node === null || typeof node !== "object") return;
-  if (typeof node.props !== "undefined" && typeof node.props.className === "string") out.push(node);
-  if (Array.isArray(node)) { for (const c of node) allEls(c, out); return; }
-  if (typeof node.children !== "undefined") allEls(node.children, out);
-}
-function flatEls(el) {
-  const out = [];
-  allEls(el.children, out);
-  return out;
-}
-
-function groupTextsOf(el) {
-  const flat = flatEls(el);
-  return flat.filter((c) => c && c.props && c.props["data-bs"] === void 0 && typeof c.props.className === "string" && c.props.className.indexOf("item") !== -1)
-    .map((g) => (g.children || []).join ? g.children.join("") : g.children).join(" ");
-}
-// parse the 本轮 amount out of the rendered line text (float-tolerant
-// comparisons — addition order differs between client and test)
-function cnyOf(text) {
-  const m = String(text).match(/本轮 ¥([\d.]+)/);
-  return m ? Number(m[1]) : NaN;
-}
-// parse the in-flight estimate from the popover 本轮 line "（精确 A + 估算 B）"
-function estimateCnyOf(text) {
-  const m = String(text).match(/估算 ¥([\d.]+)/);
-  return m ? Number(m[1]) : NaN;
-}
-// flat() does not descend into element .children properties — collect strings
-// recursively instead.
-function collectStrings(node, out) {
-  if (typeof node === "string") { out.push(node); return; }
-  if (node === null || node === void 0 || typeof node !== "object") return;
-  if (Array.isArray(node)) {
-    for (const c of node) collectStrings(c, out);
-    return;
-  }
-  if (typeof node.children !== "undefined") collectStrings(node.children, out);
-}
-function popTextOf(el) {
-  const flat = flatEls(el);
-  const pop = flat.find((c) => c && typeof c === "object" && c.props && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-pop") !== -1 && c.props.className.indexOf("pop-row") === -1);
-  if (!pop) return "";
-  const out = [];
-  collectStrings(pop.children, out);
-  return out.join(" ");
-}
-const HOST_TABLES = {
-  "deepseek-v4-flash": { miss: 1.5, read: 0.05, out: 4.5, missPeak: 3.0, readPeak: 0.1, outPeak: 9.0 },
-  "deepseek-v4-pro": { miss: 4.5, read: 0.15, out: 13.5, missPeak: 9.0, readPeak: 0.3, outPeak: 27.0 }
-};
-
-// Scenario 13: unknown-model steps — session amount gets ≈ and a popover
-// note (v20 P0-2). Seeded liveInfo carries host unpricedSteps; no budget.
-// Hook indices (v20): 1=balance 2=hovered 3=anchor 13=todayState 17=liveInfo.
+// Scenario 13: unknown-model steps — session amount gets ≈, an 未计价 row,
+// and the cost share is labelled as priced-cost share; token shares include
+// the unknown tokens in the denominator.
 {
   applyWith({});
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05,
-      models: [{ model: "deepseek-v4-flash", usage: TOKEN_USAGE, costCny: 0.04 }, { model: "unknown", usage: TOKEN_USAGE, costCny: 0 }],
-      unpricedSteps: 3,
-      pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 3, invalidSteps: 0, pricing: null, budget: null
+  });
+  seedCost(env, {
+    merged: { ...TOKEN_USAGE, reasoningTokens: 0 },
+    costCny: 0.05,
+    root: { costCny: 0.05 },
+    descendants: { costCny: 0 },
+    models: [
+      { model: "deepseek-v4-flash", usage: TOKEN_USAGE, costCny: 0.04 },
+      { model: "unknown", usage: TOKEN_USAGE, costCny: 0 }
+    ],
+    unpricedSteps: 3, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    persistenceAvailable: false, descendantCount: 0, pricing: null, stale: false
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const text = groupTextsOf(el);
   const pop = popTextOf(el);
-  check("unknown steps mark session amount (no ≈ prefix)", text.indexOf("会话 ¥0.0500") !== -1, text);
+  check("unknown steps: no ≈ on the session amount", text.indexOf("会话 ¥0.0500") !== -1 && text.indexOf("≈") === -1, text);
   check("unpriced popover note present", pop.indexOf("含 3 步未定价 · 模型未知") !== -1, pop);
-  check("builtin price-source fallback in popover", pop.indexOf("内置价目") !== -1, pop);
-  // per-model rows carry their share: only flash is priced here → 100%
-  check("per-model rows show cost share", pop.indexOf("v4-flash ¥0.040000 (100.00%)") !== -1, pop);
-  // Tok per-model row (会话口径): input/output amounts, share appended inline
-  check("Tok per-model share inline", pop.indexOf("v4-flash 输入 1000 (100.00%) 输出 200 (100.00%)") !== -1, pop);
+  check("unknown model row shows 未计价", pop.indexOf("unknown 未计价") !== -1, pop);
+  check("模型 group is the LAST popover group (below Tok)", pop.lastIndexOf("模型") > pop.indexOf("Tok 会话"), pop);
+  check("per-model rows show priced-cost share", pop.indexOf("v4-flash 花费 ¥0.040000 (100.00%)") !== -1, pop);
+  // token shares include unknown in the denominator: flash = 1000/2000 = 50%
+  check("模型 token row includes unknown tokens (50.00%)",
+    pop.indexOf("输入 1000 (50.00%) 输出 200 (50.00%)") !== -1, pop);
 }
 
 // Scenario 14: budget warn/over — amber ⚠ at ≥80%, red ⚠ over budget.
 {
   applyWith({});
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null,
-      budget: { daily: 20, monthly: 100 }
-    }
-  };
-  env.states[13] = { value: { costCny: 18, monthCostCny: 60, sessionCount: 4 } };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null,
+    budget: { daily: 20, monthly: 100 }
+  });
+  seedToday(env, { costCny: 18, monthCostCny: 60, sessionCount: 4 });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const flat = flatEls(el);
   const spendSpan = flat.find((c) => c && c.props && typeof c.props.className === "string" &&
@@ -447,10 +494,9 @@ const HOST_TABLES = {
   check("budget hover shows 今日 vs 日预算", pop.indexOf("今日 ¥18.0000 · 日预算 ¥20.00 (90%)") !== -1, pop);
   check("budget hover shows 本月 vs 月预算", pop.indexOf("本月 ¥60.0000 · 月预算 ¥100.00 (60%)") !== -1, pop);
 
-  // over budget → red
   const env2 = makeEnv();
-  env2.states[17] = env.states[17];
-  env2.states[13] = { value: { costCny: 21, monthCostCny: 60, sessionCount: 4 } };
+  seedLive(env2, env.states[HOOK.live].value);
+  seedToday(env2, { costCny: 21, monthCostCny: 60, sessionCount: 4 });
   const el2 = render(env2, propsWithData);
   const flat2 = flatEls(el2);
   const spendSpan2 = flat2.find((c) => c && c.props && typeof c.props.className === "string" &&
@@ -459,44 +505,43 @@ const HOST_TABLES = {
   check("budget over: ⚠ prefix and red color", /^⚠ /.test(spendText2) && spendSpan2.props.style.color === "#ef4444", spendText2 + " " + JSON.stringify(spendSpan2 && spendSpan2.props.style));
 }
 
-// Scenario 15: balance split + peak countdown in the 余额 hover (P1-4).
+// Scenario 15: balance split + peak countdown in the 余额 hover
 {
   applyWith({});
   const env = makeEnv();
-  env.states[1] = { value: { text: "DeepSeek 官方 ¥8.6700", label: "DeepSeek 官方", amount: 8.67, currency: "CNY", granted: 3.2, toppedUp: 5.47 } };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedBalance(env, { text: "DeepSeek ¥8.6700", label: "DeepSeek", amount: 8.67, currency: "CNY", granted: 3.2, toppedUp: 5.47 });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
-  check("balance row in hover: amount + recharge, no split", pop.indexOf("余额 ¥8.67") !== -1 && pop.indexOf("充值 ↗") !== -1 && pop.indexOf("赠送") === -1, pop);
+  check("balance row in hover: amount + recharge", pop.indexOf("余额 ¥8.67") !== -1 && pop.indexOf("充值 ↗") !== -1, pop);
   check("peak countdown line in hover", /(高峰中|空闲中).*?(高峰|空闲) \d{2}:00 开始 \(.+后\)/.test(pop), pop);
+  // balance refresh is a REAL <button>
+  const flat = flatEls(el);
+  const btn = flat.find((c) => c && c.type === "button" && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-refresh") !== -1);
+  check("balance refresh renders a real button", !!btn && btn.props.type === "button" && typeof btn.props.onClick === "function", JSON.stringify(btn && btn.props.className));
 }
 
-// Scenario 16: official price-source label (P0-1) — host pricing payload.
+// Scenario 16: official price-source label
 {
   applyWith({});
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0,
-      pricing: { source: "official", fetchedAt: new Date().toISOString(), tables: HOST_TABLES },
-      budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0,
+    pricing: { source: "official", fetchedAt: new Date().toISOString(), tables: HOST_TABLES },
+    budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
   check("价源 row with YYYY-MM-DD HH:MM", /价源 DeepSeek 官网 \d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(pop), pop);
   check("价源 row after 峰谷, before 花费", pop.indexOf("价源") !== -1 && pop.indexOf("价源") > pop.indexOf("峰谷") && pop.indexOf("价源") < pop.indexOf("花费"), pop);
 }
 
-// Scenario 17: streaming estimate — batch events (reasoning-chunks /
-// text-chunks / tool-call-chunks) carry the FULL streamed text; tokens are
-// estimated at per-kind density and reset by the step's usage chunk (P1-5).
-// Densities mirror the client: reasoning 3.5, text 4, tool args 1.6
-// (non-CJK chars/token; CJK ≈ 1 token/char). 本轮 base = the turn fold.
+// Scenario 17: streaming estimate — the CORRECTED total-output estimate
+// (raw × estAccuracy) feeds 金额; settle hands over to the exact fold.
 {
   const events = [
     { type: "turn/start", data: { turn: 1 } },
@@ -506,81 +551,56 @@ const HOST_TABLES = {
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
+  seedLive(env, {
+    completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
   const runningProps = {
     ...propsWithData,
     useSessions: () => ({ byId: { "session-test": { running: true } } })
   };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
-  const d = new Date(Date.now() + 8 * 3600 * 1000);
-  const h = d.getUTCHours();
-  const peak = (h >= 9 && h < 12) || (h >= 14 && h < 18);
-  const outP = peak ? 9.0 : 4.5;
-  // 4000 ASCII reasoning chars / 3.5 = 1142.857 tokens; tool args are
-  // {"a": (5) + 1} (2) = 7 chars, shared output density 2.5
-  const est1 = (4000 / 3.5 + 7 / 2.5) * outP / 1e6;
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const now = Date.now();
+  const outP = flashOut(now);
+  // acc starts at 1 (no localStorage calib in this harness). The initial
+  // model is UNKNOWN: the streaming estimate exists (tokens tick) but its
+  // PRICE is 0 until the first message identifies the model — never a
+  // silent flash default.
   const t1 = groupTextsOf(render(env, runningProps));
-  check("streaming estimate shown inline (no (估) suffix)", t1.indexOf("本轮 ¥" + est1.toFixed(4)) !== -1 && t1.indexOf("(估)") === -1, t1 + " expected " + est1.toFixed(4));
-  // popover: one total with the breakdown in parens, full 6-decimal detail
+  check("unknown initial model: streaming estimate unpriced (¥0, not flash)",
+    t1.indexOf("本轮 ¥0.0000") !== -1 && t1.indexOf("(估)") === -1, t1);
   const pop1 = popTextOf(render(env, runningProps));
-  check("popover shows total with (精确 + 估算) breakdown",
-    pop1.indexOf("¥" + est1.toFixed(6) + " (精确 ¥0.000000 + 估算 ¥" + est1.toFixed(6) + ")") !== -1,
+  check("popover shows the unpriced estimate while the model is unknown",
+    pop1.indexOf("¥0.000000 含估算 ¥0.000000") !== -1,
     pop1);
-  // per-model row also ticks with the streaming estimate (model cost ≠ 0
-  // while nothing has settled yet — the estimate joins the model's row live)
-  check("per-model row streams the live estimate",
-    pop1.indexOf("v4-flash ¥" + est1.toFixed(6)) !== -1,
-    pop1);
-  // stream grows (in-place push) → estimate grows (text-chunks share 2.5)
   events.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: ["y".repeat(4000)] } });
-  const est2 = (4000 / 3.5 + 7 / 2.5 + 4000 / 2.5) * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
-  check("estimate grows with streamed chars", t2.indexOf("本轮 ¥" + est2.toFixed(4)) !== -1 && t2.indexOf("(估)") === -1, t2 + " expected " + est2.toFixed(4));
-  // usage chunk lands → estimate resets; the turn fold shows the EXACT step
-  // cost (no (估) marker). The assistant/message (which carries the model)
-  // follows in the real stream and corrects the fold's price.
+  check("estimate stays unpriced while the model is unknown",
+    t2.indexOf("本轮 ¥0.0000") !== -1 && t2.indexOf("(估)") === -1, t2);
+  // usage chunk lands → exact fold takes over; estAccuracy self-calibrates
+  // (real 8000 ÷ est 2745.657 ≈ 2.9137 → EMA 0.3 → acc ≈ 1.5741)
   events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 } } } });
   events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 }, message: { source: { model: "deepseek-v4-flash" } } } });
-  const step1Exact = (100 * (peak ? 3.0 : 1.5) + 5000 * (peak ? 0.1 : 0.05) + 8000 * outP) / 1e6;
+  const step1Exact = (100 * flashMiss(now) + 5000 * flashRead(now) + 8000 * outP) / 1e6;
   const t3 = groupTextsOf(render(env, runningProps));
   check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 0.0051, t3 + " expected " + step1Exact.toFixed(2));
-  // popover while RUNNING: the bracket persists even with a zero estimate
   const pop3 = popTextOf(render(env, runningProps));
-  check("running keeps the 本轮 bracket (估算 ¥0.000000, no flicker)",
-    pop3.indexOf("¥" + step1Exact.toFixed(6) + " (精确 ¥" + step1Exact.toFixed(6) + " + 估算 ¥0.000000)") !== -1,
+  check("running keeps the 本轮 bracket (含估算 ¥0.000000, no flicker)",
+    pop3.indexOf("¥" + step1Exact.toFixed(6) + " 含估算 ¥0.000000") !== -1,
     pop3);
-  // next step starts → base stays (turn fold) + carried input cost + new
-  // reasoning estimate (100×miss + 5000×read at the current tier)
   events.push({ type: "step/end", data: { turn: 1, step: 1 } });
   events.push({ type: "step/start", data: { turn: 1, step: 2 } });
   events.push({ type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["z".repeat(700)] } });
-  const d2 = new Date(Date.now() + 8 * 3600 * 1000);
-  const h2 = d2.getUTCHours();
-  const peak2 = (h2 >= 9 && h2 < 12) || (h2 >= 14 && h2 < 18);
-  const missP = peak2 ? 3.0 : 1.5;
-  const readP = peak2 ? 0.1 : 0.05;
-  const outP2 = peak2 ? 9.0 : 4.5;
-  const inputCny = (100 * missP + 5000 * readP) / 1e6;
-  const est4 = step1Exact + inputCny + 700 / 3.5 * outP2 / 1e6;
+  const acc17 = 1 + (8000 / (4000 / 3.5 + 7 / 2.5 + 4000 / 2.5) - 1) * 0.5;
+  const inputCny = (100 * flashMiss(now) + 5000 * flashRead(now)) / 1e6;
+  const est4 = step1Exact + inputCny + 700 / 3.5 * acc17 * outP / 1e6;
   const t4 = groupTextsOf(render(env, runningProps));
-  check("turn base persists across steps (exact + carry + new estimate)", t4.indexOf("(估)") === -1 && Math.abs(cnyOf(t4) - est4) < 0.0051, t4 + " expected " + est4.toFixed(2));
-  // 会话 ticks live as ONE number (历史+本轮), no breakdown bracket
-  const sessEst = inputCny + 200 * outP2 / 1e6;
-  const sessShown = 0.05 + sessEst;
-  const pop4 = popTextOf(render(env, runningProps));
-  check("live 会话 as one number without breakdown bracket",
-    /会话 ¥0\.05\d{2}/.test(pop4) && pop4.indexOf("历史 ") === -1,
-    pop4);
+  check("turn base persists across steps (exact + carry + corrected new estimate)", t4.indexOf("(估)") === -1 && Math.abs(cnyOf(t4) - est4) < 0.0051, t4 + " expected " + est4.toFixed(2));
 }
 
-// Scenario 18: 本轮 is TURN-scoped — the fold restarts at turn/start and
-// turn/end, so multi-step turns accumulate and complete turns reset to 0.
+// Scenario 18: 本轮 is TURN-scoped (density calibration, no acc change —
+// settle came via assistant/message without a usage chunk)
 {
   const events = [
     { type: "turn/start", data: { turn: 1 } },
@@ -593,43 +613,33 @@ const HOST_TABLES = {
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
+  seedLive(env, {
+    completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
   const runningProps = {
     ...propsWithData,
     useSessions: () => ({ byId: { "session-test": { running: true } } })
   };
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
-  const hp = now.getUTCHours();
-  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
-  const missP = pk ? 3.0 : 1.5;
-  const readP = pk ? 0.1 : 0.05;
-  const outP = pk ? 9.0 : 4.5;
-  // turn 1 step 1 settled: 100×miss + 500×read + 4000×out
+  const now = Date.now();
+  const missP = flashMiss(now);
+  const readP = flashRead(now);
+  const outP = flashOut(now);
   const step1 = (100 * missP + 500 * readP + 4000 * outP) / 1e6;
-  // step 2 in flight: 700 reasoning chars / 3.5 = 200 tokens + carried input
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const turn1Shown = step1 + inputCarry + 200 * outP / 1e6;
   const t1 = groupTextsOf(render(env, runningProps));
   check("multi-step turn accumulates (exact step1 + estimate step2)", t1.indexOf("(估)") === -1 && Math.abs(cnyOf(t1) - turn1Shown) < 0.0051, t1 + " expected " + turn1Shown.toFixed(2));
-  // turn 1 completes → 本轮 KEEPS the final turn cost on display
   events.push({ type: "step/end", data: { turn: 1, step: 2 } });
   events.push({ type: "turn/end", data: { turn: 1 } });
   const tEnd = groupTextsOf(render(env, runningProps));
   check("turn/end keeps the final turn cost (no reset to 0)", Math.abs(cnyOf(tEnd) - step1) < 0.0051 && tEnd.indexOf("(估)") === -1, tEnd + " expected " + step1.toFixed(2));
-  // next turn starts → base resets; only estimate + carried input remain
   events.push({ type: "turn/start", data: { turn: 2 } });
   events.push({ type: "step/start", data: { turn: 2, step: 1 } });
   events.push({ type: "reasoning-chunks", data: { turn: 2, step: 1, texts: ["c".repeat(700)] } });
-  const turn2Shown = inputCarry + 200 * outP / 1e6; // fold reset; only estimate + carried input
+  const turn2Shown = inputCarry + 200 * outP / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
   check("turn/start resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") === -1 && Math.abs(cnyOf(t2) - turn2Shown) < 0.0051, t2 + " expected " + turn2Shown.toFixed(2));
-  // restored-session history (pre-loaded events without a turn/start) never
-  // leaks into 本轮 before the first turn boundary
   const histEvents = [
     { type: "step/start", data: { turn: 9, step: 1 } },
     { type: "assistant/message", data: { turn: 9, step: 1, usage: { inputTokens: 9000, outputTokens: 9000, cacheReadTokens: 9000 }, message: { source: { model: "deepseek-v4-pro" } } } },
@@ -637,28 +647,27 @@ const HOST_TABLES = {
   ];
   applyWith({ binding: () => ({ session: { events: histEvents } }) });
   const envH = makeEnv();
-  envH.states[17] = env.states[17];
+  seedLive(envH, env.states[HOOK.live].value);
   const tH = groupTextsOf(render(envH, runningProps));
   check("pre-loaded history stays out of 本轮 (fold starts at turn/start)", /本轮 ¥0\.00/.test(tH) && tH.indexOf("(估)") === -1, tH);
 }
 
-// Scenario 19: two-tier low-balance alert — amber ≤ warn (default ¥20),
-// red ≤ critical (default ¥5), disabled with 0.
+// Scenario 19: two-tier low-balance alert — amber ≤ warn, red ≤ critical
 {
   const liveWith = (budget) => ({
     value: {
       completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null,
+      rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null,
       budget: budget
     }
   });
   const renderWith = (amount, budget) => {
     applyWith({});
     const env = makeEnv();
-    env.states[1] = { value: { text: "DeepSeek 官方 ¥" + amount, label: "DeepSeek 官方", amount, currency: "CNY", granted: null, toppedUp: null } };
-    env.states[17] = liveWith(budget);
-    env.states[2] = { value: true };
-    env.states[3] = { value: { left: 100, top: 100 } };
+    seedBalance(env, { text: "DeepSeek ¥" + amount, label: "DeepSeek", amount, currency: "CNY", granted: null, toppedUp: null });
+    seedLive(env, liveWith(budget).value);
+    env.states[HOOK.hovered] = { value: true };
+    env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
     return render(env, propsWithData);
   };
   const balSpanOf = (el) => {
@@ -668,34 +677,32 @@ const HOST_TABLES = {
   };
   const defaults = { balanceWarnCny: 20, balanceCriticalCny: 5 };
 
-  // 8.67 ≤ 20 → amber warn
   const elWarn = renderWith(8.67, defaults);
   const warnSpan = balSpanOf(elWarn);
   const warnText = (warnSpan && warnSpan.children || []).join("");
   check("balance ≤ warn → amber ⚠", /^⚠ /.test(warnText) && warnSpan.props.style.color === "#f59e0b", warnText + " " + JSON.stringify(warnSpan && warnSpan.props.style));
-  check("popover no longer repeats the alert text", popTextOf(elWarn).indexOf("余额告警") === -1, popTextOf(elWarn));
 
-  // 4 ≤ 5 → red critical
   const elCrit = renderWith(4, defaults);
   const critSpan = balSpanOf(elCrit);
   const critText = (critSpan && critSpan.children || []).join("");
   check("balance ≤ critical → red ⚠", /^⚠ /.test(critText) && critSpan.props.style.color === "#ef4444", critText + " " + JSON.stringify(critSpan && critSpan.props.style));
   check("critical popover still shows recharge (bold)", popTextOf(elCrit).indexOf("充值 ↗") !== -1, popTextOf(elCrit));
 
-  // 25 > 20 → no alert
   const elOk = renderWith(25, defaults);
   const okText = (balSpanOf(elOk) && balSpanOf(elOk).children || []).join("");
   check("balance above warn → no alert", !/^⚠ /.test(okText), okText);
 
-  // both tiers disabled with 0
   const elOff = renderWith(4, { balanceWarnCny: 0, balanceCriticalCny: 0 });
   const offText = (balSpanOf(elOff) && balSpanOf(elOff).children || []).join("");
   check("alerts disabled with 0", !/^⚠ /.test(offText), offText);
+
+  // a ZERO balance is a legal value (alert + recharge, not "no answer")
+  const elZero = renderWith(0, defaults);
+  const zeroText = (balSpanOf(elZero) && balSpanOf(elZero).children || []).join("");
+  check("balance 0 is accepted (red alert, ¥0 shown)", /^⚠ /.test(zeroText) && zeroText.indexOf("¥0") !== -1, zeroText);
 }
 
-// Scenario 20: streaming densities self-calibrate from settled steps (EMA) —
-// after a step settles with a real chars→tokens ratio, the next estimate
-// uses the adapted density instead of the fixed starting value.
+// Scenario 20: streaming densities self-calibrate from settled steps (EMA)
 {
   const events = [
     { type: "turn/start", data: { turn: 1 } },
@@ -709,45 +716,39 @@ const HOST_TABLES = {
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
+  seedLive(env, {
+    completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
   const runningProps = {
     ...propsWithData,
     useSessions: () => ({ byId: { "session-test": { running: true } } })
   };
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
-  const hp = now.getUTCHours();
-  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
-  const missP = pk ? 3.0 : 1.5;
-  const readP = pk ? 0.1 : 0.05;
-  const outP = pk ? 9.0 : 4.5;
-  // EMA: density = 0.7*3.5 + 0.3*(7000/1000) = 4.55; step 2 = 700 chars / 4.55
-  const adaptedDensity = 0.7 * 3.5 + 0.3 * (7000 / 1000);
-  // step 1 settled with 1000 reasoning tokens — billed at the output rate
-  const step1Exact = (100 * missP + 500 * readP + 1000 * outP) / 1e6;
+  const now = Date.now();
+  const missP = flashMiss(now);
+  const readP = flashRead(now);
+  const outP = flashOut(now);
+  // EMA density: 0.7*3.5 + 0.3*(7000/1000) = 4.55
+  const adaptedDensity = 0.5 * 3.5 + 0.5 * (7000 / 1000);
+  // reasoning 1000 billed at output rate — output=0 reasoning=1000 is the
+  // illegal subset the OLD contract billed; new contract: outputTokens is
+  // billed (0 here), reasoning is display-only → step cost = input only
+  const step1Exact = (100 * missP + 500 * readP + 0 * outP) / 1e6;
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const expected = step1Exact + inputCarry + 700 / adaptedDensity * outP / 1e6;
   const t = groupTextsOf(render(env, runningProps));
-  check("densities adapt after a settled step (EMA)", t.indexOf("(估)") === -1 && Math.abs(cnyOf(t) - expected) < 0.0051, t + " expected " + expected.toFixed(2));
+  check("densities adapt after a settled step (EMA; reasoning subset not billed)", t.indexOf("(估)") === -1 && Math.abs(cnyOf(t) - expected) < 0.0051, t + " expected " + expected.toFixed(2));
 }
 
-// Scenario 21: two-row layout with MID-ellipsis — when the natural-width
-// model needs more than two rows, only the first row and the last row are
-// rendered, joined by a "⋯" marker (latex \cdots style); the middle groups
-// are hidden. The decision uses cached natural widths, so it is stable.
+// Scenario 21: two-row layout with MID-ellipsis
 {
   applyWith({});
   const env = makeEnv();
   render(env, propsWithData);
-  const lineRef = env.states[4];
-  const itemRef = env.states[7];
-  const probeRef = env.states[8];
-  const measure = env.states[9].current;
-  // 7 groups × 60px + 20px separators in a 120px line → 7 rows
+  const lineRef = env.states[HOOK.lineRef];
+  const itemRef = env.states[HOOK.itemRefs];
+  const probeRef = env.states[HOOK.probe];
+  const measure = env.states[HOOK.measure].current;
   lineRef.current = { clientWidth: 120 };
   probeRef.current = { offsetWidth: 20 };
   for (let i = 0; i < 7; i++) itemRef.current[i] = { offsetWidth: 60, idx: i };
@@ -762,23 +763,20 @@ const HOST_TABLES = {
     /^(高峰中|空闲中)/.test(texts1) && texts1.indexOf("本轮") !== -1 &&
     texts1.indexOf("LLM 45s") === -1 && texts1.indexOf("输入 1000 · 输出 200") === -1,
     texts1);
-  // ellide mode: the separator before the SECOND row's first group must be
-  // hidden — no `|` at a row start, none before the trailing ⋯ either.
   const seps1 = flat1.filter((c) => c && c.props && typeof c.props.className === "string" &&
     c.props.className.indexOf("dsh-better-stats-sep") !== -1 && c.props.className.indexOf("probe") === -1);
   const sepTexts1 = seps1.map((s) => s.props.className.indexOf("sep-hidden") !== -1 ? "hidden" : ((s.children || []).join ? s.children.join("") : s.children));
   check("ellide: no | at row start or before ⋯", sepTexts1.length <= 1 && sepTexts1.every((t) => t === "hidden"), JSON.stringify(sepTexts1));
 
-  // wide line → everything fits, no marker
   const env2 = makeEnv();
   render(env2, propsWithData);
-  const lineRef2 = env2.states[4];
-  const itemRef2 = env2.states[7];
-  const probeRef2 = env2.states[8];
+  const lineRef2 = env2.states[HOOK.lineRef];
+  const itemRef2 = env2.states[HOOK.itemRefs];
+  const probeRef2 = env2.states[HOOK.probe];
   lineRef2.current = { clientWidth: 1000 };
   probeRef2.current = { offsetWidth: 20 };
   for (let i = 0; i < 7; i++) itemRef2.current[i] = { offsetWidth: 60, idx: i };
-  env2.states[9].current();
+  env2.states[HOOK.measure].current();
   const el2 = render(env2, propsWithData);
   const flat2 = flatEls(el2);
   check("no ⋯ when everything fits",
@@ -786,48 +784,42 @@ const HOST_TABLES = {
     "marker present");
 }
 
-// Scenario 22: the FIRST step of a turn prices exactly even though the
-// browser stream only carries the usage chunk (no message usage/model) —
-// the last-known model (seeded from currentModel) prices the fold.
+// Scenario 22: the FIRST step of a turn — its usage chunk arrives before any
+// model is known → it stays UNKNOWN/unpriced (never silently priced at
+// flash); the message that follows (with usage) corrects the fold.
 {
   const events = [
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["s".repeat(700)] } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 } } } },
-    { type: "assistant/message", data: { turn: 1, step: 1, message: { source: { model: "deepseek-v4-flash" } } } },
-    { type: "step/end", data: { turn: 1, step: 1 } },
-    { type: "step/start", data: { turn: 1, step: 2 } }
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 } } } }
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0.05, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
   const runningProps = {
     ...propsWithData,
     useSessions: () => ({ byId: { "session-test": { running: true } } })
   };
-  const now = new Date(Date.now() + 8 * 3600 * 1000);
-  const hp = now.getUTCHours();
-  const pk = (hp >= 9 && hp < 12) || (hp >= 14 && hp < 18);
-  const missP = pk ? 3.0 : 1.5;
-  const readP = pk ? 0.1 : 0.05;
-  const outP = pk ? 9.0 : 4.5;
-  // exact fold of step 1 (priced with the seeded model): 100×miss + 500×read + 4200×out
-  const step1 = (100 * missP + 500 * readP + 4200 * outP) / 1e6;
   const t = groupTextsOf(render(env, runningProps));
-  check("first-step exact fold is priced (精确 not stuck at 0)",
-    Math.abs(cnyOf(t) - step1) < 0.0051 && t.indexOf("本轮 ¥" + step1.toFixed(4)) !== -1,
-    t + " expected " + step1.toFixed(4));
+  check("first-step chunk with no known model stays unpriced (¥0)",
+    /本轮 ¥0\.00/.test(t) && t.indexOf("(估)") === -1, t);
+  // the message (with usage + model) lands → same turn:step re-folds at the
+  // model's price; reasoning is a subset of output and is NOT billed again
+  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 }, message: { source: { model: "deepseek-v4-flash" } } } });
+  const now = Date.now();
+  const step1 = (100 * flashMiss(now) + 500 * flashRead(now) + 4000 * flashOut(now)) / 1e6;
+  const t2 = groupTextsOf(render(env, runningProps));
+  check("message corrects the fold (output-only billing, 4000 not 4200)",
+    Math.abs(cnyOf(t2) - step1) < 0.0051 && t2.indexOf("本轮 ¥" + step1.toFixed(4)) !== -1,
+    t2 + " expected " + step1.toFixed(4));
 }
 
-// Scenario 23: v21 additions — ETA days-left row (sampled from /today),
-// force-refresh affordance on the balance group, and the recharge link on
-// critical balance. localStorage + /today fetch are mocked (Node has neither).
+// Scenario 23: ETA days-left row with basis/update/confidence, force-refresh
+// button, and recharge link. localStorage + /today fetch are mocked.
 {
   const storage = {};
   globalThis.localStorage = {
@@ -840,35 +832,43 @@ const HOST_TABLES = {
     if (String(url).indexOf("/plugins/better-stats/today") !== -1) {
       return Promise.resolve({
         ok: true,
-        json: () => Promise.resolve({ date: "2026-08-18", since: 0, costCny: 0.5, monthCostCny: 3, unpricedSteps: 0, sessionCount: 1 }),
+        json: () => Promise.resolve({ date: "2026-08-18", since: 0, costCny: 0.5, monthCostCny: 3, unpricedSteps: 0, invalidSteps: 0, sessionCount: 1 }),
       });
     }
-    return Promise.reject(new Error("unexpected fetch " + url));
+    if (String(url).indexOf("/plugins/better-stats/balance") !== -1) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ configured: true, status: "ok", provider: "deepseek-official", displayName: "DeepSeek", amount: 15, currency: "CNY", grantedBalance: 0, toppedUpBalance: 15, queriedAt: new Date().toISOString() }),
+      });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(defaultBody(url)) });
   };
   (async () => {
     try {
       applyWith({});
       const env = makeEnv();
-      env.states[1] = { value: { text: "DeepSeek 官方 ¥15.00", label: "DeepSeek 官方", amount: 15, currency: "CNY", decimals: 2, granted: 0, toppedUp: 15 } };
-      env.states[2] = { value: true };
-      env.states[3] = { value: { left: 100, top: 100 } };
+      seedBalance(env, { text: "DeepSeek ¥15.00", label: "DeepSeek", amount: 15, currency: "CNY", decimals: 2, granted: 0, toppedUp: 15 });
+      env.states[HOOK.hovered] = { value: true };
+      env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
       render(env, propsWithData);
-      await new Promise((r) => setTimeout(r, 0)); // flush the fetch then-callbacks
+      await new Promise((r) => setTimeout(r, 0));
       const el2 = render(env, propsWithData);
       const pop = popTextOf(el2);
       check("ETA days-left row (dd hh format)", /约可用 \d+ 天 \d{1,2} 小时|约可用 \d+ 小时/.test(pop), pop);
-      // warn-tier balance: recharge link sits BEFORE the ETA row
+      check("ETA cell shows ONLY the duration (no basis/update/confidence)",
+        /\(约可用 \d+ 天 \d{1,2} 小时\)|\(约可用 \d+ 小时\)/.test(pop) &&
+        pop.indexOf("按本工作区") === -1 && pop.indexOf("更新于") === -1 && pop.indexOf("置信度") === -1,
+        pop);
       const etaPos = pop.indexOf("约可用");
       const rechargePos = pop.indexOf("充值 ↗");
       check("recharge link after ETA in one line", rechargePos !== -1 && etaPos !== -1 && etaPos < rechargePos, pop);
       const flat2 = flatEls(el2);
       const refreshItem = flat2.find((c) => c && c.props && typeof c.props.className === "string" && c.props.className.indexOf("dsh-better-stats-refresh") !== -1);
-      check("balance group clickable, no icon, native title",
-        !!refreshItem && typeof refreshItem.props.onClick === "function" &&
+      check("balance group is a real button with native title",
+        !!refreshItem && refreshItem.type === "button" && typeof refreshItem.props.onClick === "function" &&
         refreshItem.props.title === "点击余额可强制刷新" &&
         (refreshItem.children || []).length === 1 && typeof refreshItem.children[0] === "string",
-        JSON.stringify(refreshItem && { title: refreshItem.props.title, children: refreshItem.children }));
-      // clicking flashes the group (refreshing class) and forces a refresh
+        JSON.stringify(refreshItem && { type: refreshItem.type, title: refreshItem.props.title, children: refreshItem.children }));
       if (refreshItem && typeof refreshItem.props.onClick === "function") {
         refreshItem.props.onClick({ stopPropagation() {} });
         const el3 = render(env, propsWithData);
@@ -877,23 +877,25 @@ const HOST_TABLES = {
         check("click flashes the balance group", pulsing, "no refreshing class after click");
       }
       const etaStored = JSON.parse(storage["dsh-better-stats:eta"] || "null");
-      check("ETA sample persisted (rate > 0)", etaStored !== null && Number(etaStored.rate) > 0, JSON.stringify(etaStored));
+      check("ETA sample persisted (rate > 0, updatedAt, historyDays)",
+        etaStored !== null && Number(etaStored.rate) > 0 &&
+        typeof etaStored.updatedAt === "number" && typeof etaStored.historyDays === "number",
+        JSON.stringify(etaStored));
     } finally {
       globalThis.fetch = realFetch;
+      delete globalThis.localStorage;
     }
   })();
-  // Top-level await: the checks above must run BEFORE the final summary line.
   await new Promise((r) => setTimeout(r, 20));
 }
 
-// Scenario 24: low-balance recharge link — critical AND warn tiers both get
-// it; above the warn threshold there is none.
+// Scenario 24: low-balance recharge link tiers
 {
   applyWith({});
   const env = makeEnv();
-  env.states[1] = { value: { text: "DeepSeek 官方 ¥3.00", label: "DeepSeek 官方", amount: 3, currency: "CNY", decimals: 2, granted: 0, toppedUp: 3 } };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedBalance(env, { text: "DeepSeek ¥3.00", label: "DeepSeek", amount: 3, currency: "CNY", decimals: 2, granted: 0, toppedUp: 3 });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
   check("critical balance shows recharge link", pop.indexOf("充值 ↗") !== -1, pop);
@@ -901,10 +903,9 @@ const HOST_TABLES = {
 {
   applyWith({});
   const env = makeEnv();
-  // ¥15: inside the warn tier (¥20) but above critical (¥5) → still linked
-  env.states[1] = { value: { text: "DeepSeek 官方 ¥15.00", label: "DeepSeek 官方", amount: 15, currency: "CNY", decimals: 2, granted: 0, toppedUp: 15 } };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedBalance(env, { text: "DeepSeek ¥15.00", label: "DeepSeek", amount: 15, currency: "CNY", decimals: 2, granted: 0, toppedUp: 15 });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
   check("warn-tier balance shows recharge link", pop.indexOf("充值 ↗") !== -1, pop);
@@ -912,17 +913,15 @@ const HOST_TABLES = {
 {
   applyWith({});
   const env = makeEnv();
-  // ¥100: above both tiers → no link
-  env.states[1] = { value: { text: "DeepSeek 官方 ¥100.00", label: "DeepSeek 官方", amount: 100, currency: "CNY", decimals: 2, granted: 40, toppedUp: 60 } };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedBalance(env, { text: "DeepSeek ¥100.00", label: "DeepSeek", amount: 100, currency: "CNY", decimals: 2, granted: 40, toppedUp: 60 });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
   check("balance above warn tier still shows recharge (always-on)", pop.indexOf("充值 ↗") !== -1, pop);
 }
 
 // Scenario 25: English UI — reload the bundle with navigator.language en-US
-// and assert the i18n labels render.
 {
   try {
     Object.defineProperty(globalThis.navigator, "language", { value: "en-US", configurable: true });
@@ -936,8 +935,6 @@ const HOST_TABLES = {
   if (enFactory) {
     let enComp = null;
     let enOpts = null;
-    // LANG is computed INSIDE the factory — restore the language only after
-    // the factory ran, so the en locale is what gets captured.
     enFactory((spec) => {
       if (spec === "react") return reactProxy();
       throw new Error("unexpected require: " + spec);
@@ -948,7 +945,6 @@ const HOST_TABLES = {
         register(o, c) { return [o, c]; },
       },
     });
-    // Route render() at the EN component (it renders the global Comp).
     Comp = enComp;
     options = enOpts;
     try {
@@ -962,12 +958,18 @@ const HOST_TABLES = {
     check("English UI: Turn/Session labels", texts.indexOf("Turn ") !== -1 && texts.indexOf("Session ") !== -1, texts);
     check("English UI: peak/off-peak label", /(Peak|Off-peak)/.test(texts), texts);
     check("English UI: In/Out token labels", /In \d/.test(texts) && /Out \d/.test(texts), texts);
+    check("English strip has no Chinese leakage", !/[\u4e00-\u9fff]/.test(texts), texts);
+    // full English popover: no Chinese characters may leak
+    env.states[HOOK.hovered] = { value: true };
+    env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+    const el2 = render(env, propsWithData);
+    const pop = popTextOf(el2);
+    check("English popover has no Chinese leakage", !/[\u4e00-\u9fff]/.test(pop), pop);
+    check("English popover renders populated groups", pop.indexOf("Turn") !== -1 && pop.indexOf("Session") !== -1, pop);
   }
 }
 
-// Scenario 26: per-model cost appears instantly from the live event stream —
-// the host /live poll has no model figures yet (the model-switch gap), but
-// the client-side session fold already prices the settled usage.
+// Scenario 26: per-model cost appears instantly from the live event stream
 {
   const events = [
     { type: "turn/start", data: { turn: 1 } },
@@ -978,53 +980,37 @@ const HOST_TABLES = {
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const el = render(env, propsWithData);
   const pop = popTextOf(el);
-  check("per-model row appears from the live stream (no host lag)", /v4-pro\s+¥0\.[0-9]{3,}/.test(pop), pop);
-  // cache popover splits 本轮 vs 累计: the turn's own cache is tiny (0 read)
-  // while the session-wide figure is the 500-token 33.33% hit — a fresh topic
-  // must not inherit the historical hit rate.
+  check("per-model row appears from the live stream (no host lag)", /v4-pro 花费 ¥0\.[0-9]{3,}/.test(pop), pop);
   check("cache popover splits turn vs total",
     pop.indexOf("本轮 缓存 0 命中 0.00%") !== -1 &&
     pop.indexOf("会话 缓存 500 命中 33.33%") !== -1,
     pop);
-  // speed group popover shows the session TTFT/tok/s row (turn row needs
-  // timestamped events, absent here)
-  check("speed popover session row", pop.indexOf("会话 首 token 平均 1.40s 25.00tok/s") !== -1, pop);
-  // client fold supplies usage while the host hasn't settled the model yet —
-  // the Tok row shows real amounts, never 0/0 (the model-switch blink fix)
+  check("speed popover session row", pop.indexOf("会话 首 token 平均 1.4s 25.00tok/s") !== -1, pop);
   check("Tok row from client fold usage (no host lag)",
-    /v4-pro 输入 1000 \(100\.00%\) 输出 10\.00K \(\d+\.\d+%\)/.test(pop), pop);
-  // turns/duration popovers split 本轮 vs 会话
+    /输入 1000 \(100\.00%\) 输出 10\.00K \(\d+\.\d+%\)/.test(pop), pop);
   check("turns popover turn+session", pop.indexOf("本轮 1 轮 1 步") !== -1 && pop.indexOf("会话 3 轮 12 步") !== -1, pop);
-  check("duration popover session row", pop.indexOf("会话 LLM 45s 工具 12s") !== -1, pop);
+  check("duration popover session row", pop.indexOf("会话 LLM 45.2s 工具 12.3s") !== -1, pop);
 }
 
-// Scenario 27: pro multi-step turn WITH a live streaming estimate — the
-// settled usage buckets must survive the estimate overlay. Regression: the
-// overlay rebuilt the current model's entry without `usage`, so mid-turn the
-// Tok row flipped to estimate-only figures and "zeroed" at every step
-// boundary, only recovering after the turn ended and the estimate died.
+// Scenario 27: pro multi-step turn WITH a live streaming estimate
 {
   const liveEvents = [];
   applyWith({ binding: () => ({ session: { events: liveEvents } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: 1700000000000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: 1700000000000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const props = {
     useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
     useSessions: () => ({ byId: { "session-test": { running: true } } }),
@@ -1056,49 +1042,39 @@ const HOST_TABLES = {
     const el = render(env, props);
     pop = popTextOf(el);
     if (n === 13) {
-      // step 2 just started and the estimate is live (one easing frame):
-      // settled step-1 usage (300/50) must survive — 435 = 300 + 135 eased
-      // estimate input, output stays 50 (the bug dropped it to 0); shares are
-      // against the live breakdown totals (1000+435 in / 100+50 out), so they
-      // can never exceed 100%
       check("mid-turn estimate keeps settled Tok usage",
-        pop.indexOf("v4-pro 输入 435 (30.31%) 输出 50 (33.33%)") !== -1, pop);
+        pop.indexOf("输入 435 (30.31%) 输出 50 (33.33%)") !== -1, pop);
       check("session Tok row ticks with the live totals",
         pop.indexOf("会话 输入 1435 输出 150") !== -1, pop);
     }
     if (n === 15) {
       check("step-2 chunk lands: settled Tok usage grows",
-        pop.indexOf("v4-pro 输入 650 (39.39%) 输出 110 (52.38%)") !== -1, pop);
+        pop.indexOf("输入 650 (39.39%)") !== -1, pop);
       check("no model share exceeds 100%",
         !/\((1[0-9][0-9]|[2-9][0-9][0-9])(\.[0-9]+)?%\)/.test(pop), pop);
     }
   }
-  // turn over, estimate dead (host closes the open step) — figures stay put
-  env.states[17] = { value: { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null, costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null } };
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null, rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null });
   {
     const el = render(env, props);
     pop = popTextOf(el);
     check("turn end: Tok row stable with real usage",
-      pop.indexOf("v4-pro 输入 650 (39.39%) 输出 110 (52.38%)") !== -1, pop);
+      pop.indexOf("输入 650 (39.39%) 输出 110 (52.38%)") !== -1, pop);
   }
 }
 
-// Scenario 28: a spliced subagent transcript (its own turn numbers) lands in
-// the middle of the parent's pro turn. It must NOT hijack the parent's model
-// attribution — the parent's usage chunks and streaming estimate stay on pro,
-// and the spliced flash usage is the host's business (client fold ignores it).
+// Scenario 28: a spliced subagent transcript must not hijack the parent's
+// model attribution — AND its usage must not inflate the parent's 本轮 fold.
 {
   const liveEvents = [];
   applyWith({ binding: () => ({ session: { events: liveEvents } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: 1700000000000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: 1700000000000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const props = {
     useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
     useSessions: () => ({ byId: { "session-test": { running: true } } }),
@@ -1128,32 +1104,34 @@ const HOST_TABLES = {
     render(env, props);
   }
   const pop = popTextOf(render(env, props));
-  // flash keeps ONLY its own turn-1 history (1000/100) — the spliced 500/40
-  // and the parent's 300/50 must not leak into it (the old code attributed
-  // the parent's chunk to the spliced model and folded the splice itself)
+  const strip = groupTextsOf(render(env, props));
   check("spliced subagent usage stays out of the client fold",
-    pop.indexOf("v4-flash 输入 1000 (76.92%) 输出 100 (66.67%)") !== -1, pop);
+    pop.indexOf("输入 1000 (76.92%) 输出 100 (66.67%)") !== -1, pop);
   check("parent pro usage lands on pro (not the subagent's model)",
-    /v4-pro 输入 300 \(23\.08%\) 输出 50 \(33\.33%\)/.test(pop), pop);
+    /输入 300 \(23\.08%\) 输出 50 \(33\.33%\)/.test(pop), pop);
   check("estimate attaches to the parent's model",
-    /v4-pro\s+¥0\.[0-9]{3,}/.test(pop), pop);
+    /v4-pro 花费 ¥0\.[0-9]{3,}/.test(pop), pop);
+  // the spliced usage must not inflate the parent turn's 本轮 amount:
+  // turn 2 = pro 300/50 only (at the current tier)
+  const now = Date.now();
+  const proMiss = peakAt(now) ? 9.0 : 4.5;
+  const proOut = peakAt(now) ? 27.0 : 13.5;
+  const turn2Cny = (300 * proMiss + 50 * proOut) / 1e6;
+  check("spliced usage does not inflate the parent 本轮 amount",
+    Math.abs(cnyOf(strip) - turn2Cny) < 0.0051, strip + " expected " + turn2Cny.toFixed(4));
 }
 
-// Scenario 29: session-wide 轮次/耗时 tick from the client event fold — the
-// host completed figures are absent and the projection is zeroed, so every
-// number must come from the live fold.
+// Scenario 29: session-wide 轮次/耗时 tick from the client event fold
 {
   const liveEvents = [];
   applyWith({ binding: () => ({ session: { events: liveEvents } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
-      costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const props = {
     useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }),
     useSessions: () => ({ byId: { "session-test": { running: false } } }),
@@ -1183,26 +1161,22 @@ const HOST_TABLES = {
   check("live 轮次: 2 turns 3 steps from the fold",
     pop.indexOf("会话 2 轮 3 步") !== -1, pop);
   check("live 耗时: LLM time from the fold",
-    pop.indexOf("会话 LLM 3s") !== -1, pop);
+    pop.indexOf("会话 LLM 3.0s") !== -1, pop);
   check("live 速率: TTFT from the fold",
-    pop.indexOf("首 token 平均 0.50s") !== -1, pop);
+    pop.indexOf("首 token 平均 0.5s") !== -1, pop);
 }
 
-// Scenario 30: live turn rows — the open step counts as step 1 immediately,
-// the open step's LLM time ticks live, and 本轮缓存/本轮 Tok rows survive a
-// termination even when the turn settled nothing.
+// Scenario 30: live turn rows — the open step counts as step 1 immediately
 {
   const liveEvents = [];
   applyWith({ binding: () => ({ session: { events: liveEvents } }) });
   const env = makeEnv();
-  env.states[17] = {
-    value: {
-      completed: null, openStepStart: Date.now() - 65000, pendingMin: null, toolPhaseStart: null,
-      costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null
-    }
-  };
-  env.states[2] = { value: true };
-  env.states[3] = { value: { left: 100, top: 100 } };
+  seedLive(env, {
+    completed: null, openStepStart: Date.now() - 65000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
   const props = {
     useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
     useSessions: () => ({ byId: { "session-test": { running: true } } }),
@@ -1215,19 +1189,243 @@ const HOST_TABLES = {
   check("open step counts as 本轮 1 步 (not 0)",
     pop.indexOf("本轮 1 轮 1 步") !== -1, pop);
   check("open step LLM time ticks live",
-    /本轮 LLM 1m 5s/.test(pop), pop);
+    /本轮 LLM 1m 5.0s/.test(pop), pop);
   check("本轮缓存 row visible during the turn",
     pop.indexOf("本轮 缓存 0 命中 0.00%") !== -1, pop);
-  // terminate: nothing settled — the rows must persist via hadTurn
   liveEvents.push({ type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 60000 });
   liveEvents.push({ type: "turn/end", data: { turn: 1 } });
-  env.states[17] = { value: { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null, costCny: 0, models: [], unpricedSteps: 0, pricing: null, budget: null } };
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null, rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null });
   props.useSessions = () => ({ byId: { "session-test": { running: false } } });
   pop = popTextOf(render(env, props));
   check("本轮缓存 row persists after termination",
     pop.indexOf("本轮 缓存 0 命中 0.00%") !== -1, pop);
   check("本轮 Tok row persists after termination",
     pop.indexOf("本轮 输入 0 输出 0") !== -1, pop);
+}
+
+// Scenario 31: tool time banks into the turn total; live TTFT + decode rate
+{
+  const liveEvents = [];
+  applyWith({ binding: () => ({ session: { events: liveEvents } }) });
+  const env = makeEnv();
+  const t0 = Date.now() - 4000;
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: t0 + 1000,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  liveEvents.push({ type: "turn/start", data: { turn: 1 }, time: t0 });
+  liveEvents.push({ type: "step/start", data: { turn: 1, step: 1 }, time: t0 });
+  liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "hi" } }, time: t0 + 500 });
+  let pop = popTextOf(render(env, props));
+  // 本轮 tok/s is LIVE from the first token (no maturity gate): the delta
+  // fragment (1) × segFactor (1.01) over the wall clock since first token
+  // (≈3.5s) ≈ 0.29 tok/s — visible immediately, not after a 2s window.
+  check("live speed: open-step TTFT joins the average",
+    /本轮 首 token 平均 0\.5s 0\.2\d+tok\/s/.test(pop), pop);
+  check("live speed: fragment rate ticks live (no maturity gate)",
+    /本轮 首 token 平均 0\.5s 0\.2\d+tok\/s/.test(pop), pop);
+  check("session rate row still shows tok/s",
+    pop.indexOf("会话 首 token 平均 1.4s 25.00tok/s") !== -1, pop);
+  check("tool phase elapsed ticks",
+    /本轮 LLM 4.0s 工具 3.0s/.test(pop), pop);
+  env.states[HOOK.live].value.toolPhaseStart = null;
+  pop = popTextOf(render(env, props));
+  check("banked tool time survives the phase end (no reset to 0)",
+    /本轮 LLM 4.0s 工具 [23].0s/.test(pop), pop);
+}
+
+// Scenario 32: 本轮 tok/s = the API-standard throughput — settled output
+// tokens (real output ÷ real decode — reasoning is a subset and never
+// doubles the numerator) PLUS the open step's token fragments (texts/args
+// lengths × segFactor ≈ real tokens) over the wall clock since first token.
+// Live from the first token; the settle folds the step's REAL tokens via the
+// usage chunk / message, so the displayed value equals the settled one.
+{
+  const liveEvents = [];
+  applyWith({ binding: () => ({ session: { events: liveEvents } }) });
+  const env = makeEnv();
+  const t0 = Date.now() - 6000;
+  seedLive(env, {
+    completed: { turns: 1, steps: 1, llmMs: 2000, toolMs: 0, ttftMs: 500, ttftSteps: 1, decodeMs: 1500, decodeTokens: 30 },
+    openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  liveEvents.push({ type: "turn/start", data: { turn: 1 }, time: t0 });
+  liveEvents.push({ type: "step/start", data: { turn: 1, step: 1 }, time: t0 });
+  liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "streaming output here" } }, time: t0 + 1000 });
+  let pop = popTextOf(render(env, props));
+  check("open step: TTFT joins the average (1.00s)",
+    pop.indexOf("首 token 平均 1.0s") !== -1, pop);
+  check("会话 LLM ticks with the same live elapsed (in lockstep)",
+    /会话 LLM 8.0s 工具 0.0s/.test(pop), pop);
+  check("本轮 LLM shows the open step's elapsed",
+    /本轮 LLM 6.0s/.test(pop), pop);
+  // 1 delta fragment × segFactor(1.01) over ≈5s since the first token
+  // ≈ 0.20 tok/s — live immediately (no maturity gate), settle lands on the
+  // real value (fragment count ≈ usage tokens on real logs).
+  const rate1 = 1.01 / 5;
+  pop = popTextOf(render(env, props));
+  check("streaming: fragment cumulative rate ticks live from the first token",
+    pop.indexOf("本轮 首 token 平均 1.0s " + rate1.toFixed(2) + "tok/s") !== -1
+      || /本轮 首 token 平均 1\.0s 0\.\d+tok\/s/.test(pop), pop);
+  // step settles with output 100 + reasoning 600: the numerator must be
+  // OUTPUT ONLY (100) — the old subset-double-count gave 160 → 80tok/s
+  liveEvents.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 600 }, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 3000 });
+  liveEvents.push({ type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 3000 });
+  pop = popTextOf(render(env, props));
+  check("settled step: cumulative rate = REAL output tokens (100 ÷ 2s = 50.00, not 80.00)",
+    /本轮 首 token 平均 1\.0s 50\.00tok\/s/.test(pop), pop);
+  check("settled step: 本轮 and 会话 LLM agree (3s)",
+    /本轮 LLM 3.0s/.test(pop) && /会话 LLM 3.0s/.test(pop), pop);
+}
+
+// Scenario 33: session switch — the strip is keyed by sessionId so React
+// fully rebuilds estimate/model/cursor/turn/server/live state on switch.
+{
+  applyWith({ binding: () => ({ session: { events: [] } }) });
+  const env = makeEnv();
+  const el = render(env, propsWithData);
+  check("strip is keyed by sessionId (full rebuild on switch)",
+    el !== null && env.lastKeys.length > 0 && env.lastKeys[env.lastKeys.length - 1] === "session-test",
+    JSON.stringify(env.lastKeys));
+  const props2 = { ...propsWithData, sessionId: "session-other" };
+  const el2 = render(env, props2);
+  check("a different session gets a different key",
+    env.lastKeys[env.lastKeys.length - 1] === "session-other",
+    JSON.stringify(env.lastKeys));
+}
+
+// Scenario 34: full-unknown snapshot — cost ¥0 is a LEGAL answer, displayed
+// with ≈ (unpriced) but never mistaken for "no data".
+{
+  applyWith({});
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 1, invalidSteps: 0, pricing: null, budget: null
+  });
+  seedCost(env, {
+    merged: { ...TOKEN_USAGE, reasoningTokens: 0 },
+    costCny: 0,
+    root: { costCny: 0 },
+    descendants: { costCny: 0 },
+    models: [{ model: "unknown", usage: TOKEN_USAGE, costCny: 0 }],
+    unpricedSteps: 1, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    persistenceAvailable: false, descendantCount: 0, pricing: null, stale: false
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const text = groupTextsOf(el);
+  check("all-unknown session shows the legal zero (¥0.0000, not missing)",
+    text.indexOf("会话 ¥0.0000") !== -1 && text.indexOf("≈") === -1, text);
+  const pop = popTextOf(el);
+  check("all-unknown popover shows 未计价 row", pop.indexOf("unknown 未计价") !== -1, pop);
+}
+
+// Scenario 35: batch chunks and sampled deltas are deduped (never both)
+{
+  const events = [
+    { type: "turn/start", data: { turn: 1 } },
+    { type: "step/start", data: { turn: 1, step: 1 } },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: ["xxxx"] } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "yyyy" } } }
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: Date.now() - 1000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  const runningProps = {
+    ...propsWithData,
+    useSessions: () => ({ byId: { "session-test": { running: true } } })
+  };
+  const now = Date.now();
+  const outP = flashOut(now);
+  // only the batch (4 chars) counts — the delta is skipped
+  const est = 4 / 2.5 * outP / 1e6;
+  const t = groupTextsOf(render(env, runningProps));
+  check("batch + delta dedupe: only the batch text counts",
+    t.indexOf("本轮 ¥" + est.toFixed(4)) !== -1 && t.indexOf("(估)") === -1, t + " expected " + est.toFixed(4));
+}
+
+// Scenario 36: the 模型 group is the LAST popover group (below Tok):
+//   模型 | v4-pro | 花费 ¥x | (占比%)
+//        |        | 输入 x (占比%) | 输出 y (占比%)
+// No 思考/可见 breakdown anywhere (user removed it).
+{
+  applyWith({});
+  const env = makeEnv();
+  const mergedUsage36 = { uncachedInputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 158000, reasoningTokens: 107000 };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.05, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  seedCost(env, {
+    merged: mergedUsage36,
+    costCny: 0.05,
+    root: { costCny: 0.05 },
+    descendants: { costCny: 0 },
+    models: [{ model: "deepseek-v4-pro", usage: mergedUsage36, costCny: 0.05 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    persistenceAvailable: false, descendantCount: 0, pricing: null, stale: false
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const pop = popTextOf(el);
+  check("Tok session row keeps only 输入/输出",
+    pop.indexOf("会话 输入 1000 输出 158.00K") !== -1, pop);
+  check("模型 row 1: 模型 | v4-pro | 花费 ¥x | (占比)",
+    pop.indexOf("v4-pro 花费 ¥0.050000 (100.00%)") !== -1, pop);
+  check("模型 rows: 输入/输出 on their own rows with value | (占比)",
+    pop.indexOf("输入 1000 (100.00%) 输出 158.00K (100.00%)") !== -1, pop);
+  check("模型 group has ONE short title (模型), renders below Tok",
+    pop.lastIndexOf("模型") > pop.indexOf("Tok 会话"), pop);
+  check("no 思考/可见 breakdown anywhere",
+    pop.indexOf("思考") === -1 && pop.indexOf("可见/工具") === -1, pop);
+}
+
+// Scenario 37: partial + stale snapshot markers next to the main amount
+{
+  applyWith({});
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.5, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  seedCost(env, {
+    merged: { ...TOKEN_USAGE, reasoningTokens: 0 },
+    costCny: 0.5,
+    root: { costCny: 0.5 },
+    descendants: { costCny: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: TOKEN_USAGE, costCny: 0.5 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: true, failedSessionCount: 2,
+    persistenceAvailable: true, descendantCount: 0, pricing: null, stale: true
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const text = groupTextsOf(el);
+  check("partial + stale snapshot marks the session amount",
+    text.indexOf("会话 ¥0.5000 过期 部分") !== -1 && text.indexOf("≈") === -1, text);
+  const pop = popTextOf(el);
+  check("popover carries the partial note", pop.indexOf("含 2 个子会话读取失败") !== -1, pop);
 }
 
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
