@@ -302,14 +302,44 @@ function flashRead(now) { return peakAt(now) ? 0.1 : 0.05; }
     "len=" + env.states.length + " 29=" + JSON.stringify(env.states[29] && env.states[29].current) + " 31=" + typeof (env.states[31] && env.states[31].current));
 }
 
-// Scenario 1: no data at all → placeholder, never null
+// Scenario 1: no data at all → every group still renders with placeholders
+// (dash / legal zeros) instead of waiting for data to appear
 {
   const env = makeEnv();
   const el = render(env, propsNoData);
   const texts0 = groupTextsOf(el);
   check("no-data still renders the line with the 峰谷 group",
-    !!(el && el.props && el.props["data-bs"] === "v20") && texts0.indexOf("峰谷") === -1 && /^(高峰中|空闲中)$/.test(texts0),
+    !!(el && el.props && el.props["data-bs"] === "v20") && /^(高峰中|空闲中) /.test(texts0),
     JSON.stringify(el).slice(0, 140) + " texts=" + texts0);
+  check("no-data shows ALL groups with dash placeholders",
+    texts0.indexOf("本轮 - · 会话 -") !== -1 &&
+    texts0.indexOf("0 轮 · 0 步") !== -1 &&
+    texts0.indexOf("LLM - · 工具 -") !== -1 &&
+    texts0.indexOf("--") !== -1,
+    "texts=" + texts0);
+}
+
+// Scenario 1b: fresh-chat shape — projections exist but are all zeros →
+// every group shows legal zeros (spend ¥0.0000, 缓存 0 · 命中 0.00%,
+// 输入 0 · 输出 0) instead of hiding until data arrives
+{
+  const env = makeEnv();
+  const zeroUsage = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const zeroStats = { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 };
+  const el = render(env, {
+    useProjection: (key) => (key === "tokenUsage" ? zeroUsage : zeroStats),
+    useSessions: () => ({ byId: {} }),
+    sessionId: "session-test",
+  });
+  const texts = groupTextsOf(el);
+  check("fresh chat shows 缓存 with legal zero hit",
+    /缓存 0 · 命中 0\.00%/.test(texts), texts);
+  check("fresh chat shows 输入/输出 zeros",
+    /输入 0 · 输出 0/.test(texts), texts);
+  check("fresh chat shows 本轮/会话 zero spend",
+    /本轮 ¥0\.0000 · 会话 ¥0\.0000/.test(texts), texts);
+  check("fresh chat shows 0 轮 · 0 步 and dash durations",
+    texts.indexOf("0 轮 · 0 步") !== -1 && texts.indexOf("LLM - · 工具 -") !== -1, texts);
 }
 
 // Scenario 2: data present, no balance yet → full line with groups
@@ -1223,14 +1253,16 @@ check("stats line caps at two rows with ellipsis style",
   liveEvents.push({ type: "turn/start", data: { turn: 1 }, time: t0 });
   liveEvents.push({ type: "step/start", data: { turn: 1, step: 1 }, time: t0 });
   liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "hi" } }, time: t0 + 500 });
+  liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "there" } }, time: t0 + 1500 });
   let pop = popTextOf(render(env, props));
-  // 本轮 tok/s is LIVE from the first token (no maturity gate): the delta
-  // fragment (1) × segFactor (1.01) over the wall clock since first token
-  // (≈3.5s) ≈ 0.29 tok/s — visible immediately, not after a 2s window.
+  // 本轮 tok/s is LIVE from the first token (no maturity gate): 2 delta
+  // fragments × segFactor (1.01) over the server-time decode window
+  // (1500 − 500 = 1s) = 2.02 tok/s — visible immediately, and the push-domain
+  // wall anchors (firstTokWall/lastTokWall) keep the settle from jumping.
   check("live speed: open-step TTFT joins the average",
-    /本轮 首 token 平均 0\.5s 0\.2\d+tok\/s/.test(pop), pop);
+    /本轮 首 token 平均 0\.5s 2\.0\d+tok\/s/.test(pop), pop);
   check("live speed: fragment rate ticks live (no maturity gate)",
-    /本轮 首 token 平均 0\.5s 0\.2\d+tok\/s/.test(pop), pop);
+    /本轮 首 token 平均 0\.5s 2\.0\d+tok\/s/.test(pop), pop);
   check("session rate row still shows tok/s",
     pop.indexOf("会话 首 token 平均 1.4s 25.00tok/s") !== -1, pop);
   check("tool phase elapsed ticks",
@@ -1267,6 +1299,7 @@ check("stats line caps at two rows with ellipsis style",
   liveEvents.push({ type: "turn/start", data: { turn: 1 }, time: t0 });
   liveEvents.push({ type: "step/start", data: { turn: 1, step: 1 }, time: t0 });
   liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "streaming output here" } }, time: t0 + 1000 });
+  liveEvents.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "more tokens now" } }, time: t0 + 2000 });
   let pop = popTextOf(render(env, props));
   check("open step: TTFT joins the average (1.00s)",
     pop.indexOf("首 token 平均 1.0s") !== -1, pop);
@@ -1274,14 +1307,14 @@ check("stats line caps at two rows with ellipsis style",
     /会话 LLM 8.0s 工具 0.0s/.test(pop), pop);
   check("本轮 LLM shows the open step's elapsed",
     /本轮 LLM 6.0s/.test(pop), pop);
-  // 1 delta fragment × segFactor(1.01) over ≈5s since the first token
-  // ≈ 0.20 tok/s — live immediately (no maturity gate), settle lands on the
-  // real value (fragment count ≈ usage tokens on real logs).
-  const rate1 = 1.01 / 5;
+  // 2 delta fragments × segFactor(1.01) over the server-time decode window
+  // (2000 − 1000 = 1s) = 2.02 tok/s — live immediately (no maturity gate);
+  // the settle folds the real tokens via the usage chunk / message, landing
+  // on the displayed value (push-domain anchors cancel the latency).
+  const rate1 = 2.02;
   pop = popTextOf(render(env, props));
   check("streaming: fragment cumulative rate ticks live from the first token",
-    pop.indexOf("本轮 首 token 平均 1.0s " + rate1.toFixed(2) + "tok/s") !== -1
-      || /本轮 首 token 平均 1\.0s 0\.\d+tok\/s/.test(pop), pop);
+    pop.indexOf("本轮 首 token 平均 1.0s " + rate1.toFixed(2) + "tok/s") !== -1, pop);
   // step settles with output 100 + reasoning 600: the numerator must be
   // OUTPUT ONLY (100) — the old subset-double-count gave 160 → 80tok/s
   liveEvents.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 600 }, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 3000 });

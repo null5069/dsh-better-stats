@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.1.9 (unreleased — prepared, not yet published)
+## 0.1.10 (unreleased — prepared, not yet published)
+
+- **rate settle drift fix**: the live decode window switched from the wall
+  clock (`Date.now() − firstTokenTime`) to the **push-domain span**
+  (`lastTokWall − firstTokWall`, the arrival times of the step's first/last
+  token events). The constant push latency cancels between the two anchors,
+  so the window matches the settle's server-domain `decodeMs` — no more
+  gradual drift down during a step (140 → 135/130) followed by a jump back
+  to the real average at the settle. Server-time fallback
+  (`lastTokEvt − firstTokenTime`) covers steps whose events carry no wall
+  anchor. Real-session replay: settle jump median 0.00%, p90 0.06%, no
+  >+3% cases. Tests updated (Scenario 31/32 assert the server-time window).
+- **fresh-chat placeholder strip**: every group renders from the start —
+  an empty session shows 轮次/耗时/速率/缓存/花费/Tok with legal zeros or
+  dashes (`0 轮 · 0 步`, `LLM - · 工具 -`, `--`, `缓存 0 · 命中 0.00%`,
+  `输入 0 · 输出 0`, `本轮 ¥0.0000 · 会话 ¥0.0000`) instead of waiting for
+  data to appear; the turns/time/speed groups are gated on the projection
+  only (dash placeholders when it is missing entirely), the spend group
+  shows a dash pair without a usage projection, and the cache hit of an
+  empty session is a legal 0.00% (no more hidden groups on a new chat).
+
+## 0.1.9 (2026-08-21)
 
 Accounting correctness (P1) — the release gate:
 
