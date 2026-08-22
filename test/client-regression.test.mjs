@@ -23,11 +23,19 @@ import { readFileSync } from "node:fs";
 // Pin it to zh-CN here (override with BS_LANG for a fully-English run) so the
 // zh assertions never depend on the machine's locale — scenario 25 explicitly
 // re-loads the bundle with en-US for the English half of the suite.
+// Node < 21 has no global navigator (it was added in Node 21), so pin the
+// property when present and otherwise install a minimal global; the bundle
+// reads navigator.language at load time.
+function pinNavigatorLanguage(lang) {
+  try {
+    Object.defineProperty(globalThis.navigator, "language", { value: lang, configurable: true });
+  } catch (e) {
+    Object.defineProperty(globalThis, "navigator", { value: { language: lang }, configurable: true });
+  }
+}
 {
   const forced = process.env.BS_LANG || "zh-CN";
-  try {
-    Object.defineProperty(globalThis.navigator, "language", { value: forced, configurable: true });
-  } catch (e) { /* keep whatever the runtime reports */ }
+  pinNavigatorLanguage(forced);
   console.log("client suite locale:", forced);
 }
 
@@ -953,9 +961,7 @@ check("stats line caps at two rows with ellipsis style",
 
 // Scenario 25: English UI — reload the bundle with navigator.language en-US
 {
-  try {
-    Object.defineProperty(globalThis.navigator, "language", { value: "en-US", configurable: true });
-  } catch (e) { /* keep zh */ }
+  pinNavigatorLanguage("en-US");
   let enFactory = null;
   globalThis.window.__ModuleLoader__.load = (handoff) => { enFactory = handoff.factory; };
   new Function("window", "require", code)(globalThis.window, (spec) => {
@@ -977,9 +983,7 @@ check("stats line caps at two rows with ellipsis style",
     });
     Comp = enComp;
     options = enOpts;
-    try {
-      Object.defineProperty(globalThis.navigator, "language", { value: "zh-CN", configurable: true });
-    } catch (e) { /* ignore */ }
+    pinNavigatorLanguage("zh-CN");
     const env = makeEnv();
     const el = render(env, propsWithData);
     const flat = flatEls(el);

@@ -83,7 +83,9 @@ function reactProxy() {
 
 try {
   Object.defineProperty(globalThis.navigator, "language", { value: "zh-CN", configurable: true });
-} catch (e) { /* keep whatever */ }
+} catch (e) {
+  Object.defineProperty(globalThis, "navigator", { value: { language: "zh-CN" }, configurable: true });
+}
 globalThis.window = { __ModuleLoader__: { load(handoff) { factory = handoff.factory; } } };
 let factory = null;
 new Function("window", "require", code)(globalThis.window, (spec) => {

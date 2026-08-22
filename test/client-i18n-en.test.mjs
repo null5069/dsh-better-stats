@@ -11,9 +11,13 @@ const check = (name, cond, detail) => {
   if (!cond) failures++;
 };
 
+// Node < 21 has no global navigator, so pin the property when present and
+// otherwise install a minimal global; the bundle reads it at load time.
 try {
   Object.defineProperty(globalThis.navigator, "language", { value: "en-US", configurable: true });
-} catch (e) { /* ignore */ }
+} catch (e) {
+  Object.defineProperty(globalThis, "navigator", { value: { language: "en-US" }, configurable: true });
+}
 
 const code = readFileSync(new URL("../lib/client.js", import.meta.url), "utf8");
 
