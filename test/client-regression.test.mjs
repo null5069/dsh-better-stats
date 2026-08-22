@@ -1037,6 +1037,11 @@ check("stats line caps at two rows with ellipsis style",
 // Scenario 26: per-model cost appears instantly from the live event stream
 {
   const events = [
+    { type: "turn/start", data: { turn: 0 } },
+    { type: "step/start", data: { turn: 0, step: 1 } },
+    { type: "assistant/message", data: { turn: 0, step: 1, usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 500, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() - 1 },
+    { type: "step/end", data: { turn: 0, step: 1 } },
+    { type: "turn/end", data: { turn: 0 } },
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 10000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
@@ -1108,9 +1113,9 @@ check("stats line caps at two rows with ellipsis style",
     pop = popTextOf(el);
     if (n === 13) {
       check("mid-turn estimate keeps settled Tok usage",
-        pop.indexOf("输入 435 (30.31%) 输出 50 (33.33%)") !== -1, pop);
+        /输入 58[78] \(\d+\.\d+%\) 输出 50 \(33\.33%\)/.test(pop), pop);
       check("session Tok row ticks with the live totals",
-        pop.indexOf("会话 输入 1435 输出 150") !== -1, pop);
+        /会话 输入 158[78] 输出 150/.test(pop), pop);
     }
     if (n === 15) {
       check("step-2 chunk lands: settled Tok usage grows",
@@ -2214,42 +2219,104 @@ check("spliced child message does not hijack the parent's request route",
 }
 
 // Scenario 56: provisional next-step input/cache must use the same live gate
-// as output. If a run stops abnormally without end events, the last smoothed
-// carry must disappear instead of becoming a permanent session total.
+// as output. Its animation is driven by wall time (not render/chunk count),
+// advances in 本轮 + 会话 + strip together, and atomically hands off to usage.
 {
-  const t0 = Date.now() - 3000;
-  const usage = { inputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
-  const events = [
-    { type: "turn/start", data: { turn: 1 }, time: t0 },
-    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
-    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
-    { type: "step/start", data: { turn: 1, step: 2 }, time: t0 + 2000 },
-  ];
-  applyWith({ binding: () => ({ session: { events } }) });
-  const env = makeEnv();
-  seedLive(env, {
-    completed: null, openStepStart: t0 + 2000, pendingMin: null, toolPhaseStart: null,
-    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
-    seedLength: 0
-  });
-  env.states[HOOK.hovered] = { value: true };
-  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
-  const projection = { uncachedInputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
-  const zeroStats = { turns: 1, steps: 1, llmMs: 1000, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 };
-  const makeProps = (running) => ({
-    useProjection: (key) => key === "tokenUsage" ? projection : zeroStats,
-    useSessions: () => ({ byId: { "session-test": { running } } }),
-    sessionId: "session-test",
-  });
-  const livePop = popTextOf(render(env, makeProps(true)));
-  check("estimate gate: live next step exposes provisional input carry",
-    /本轮 输入 145 输出 10\b/.test(livePop), livePop);
-  const stoppedPop = popTextOf(render(env, makeProps(false)));
-  check("estimate gate: abnormal stop clears provisional input/cache without end events",
-    /本轮 输入 100 输出 10\b/.test(stoppedPop) && /会话 输入 100 输出 10\b/.test(stoppedPop) &&
-      stoppedPop.indexOf("输入 145") === -1,
-    stoppedPop);
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  Date.now = () => fakeNow;
+  try {
+    const t0 = fakeNow - 2000;
+    const step2Start = fakeNow;
+    const usage = { inputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 25, outputTokens: 10, reasoningTokens: 0 };
+    const events = [
+      { type: "turn/start", data: { turn: 1 }, time: t0 },
+      { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+      { type: "assistant/message", data: { turn: 1, step: 1, usage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+      { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+      { type: "step/start", data: { turn: 1, step: 2 }, time: step2Start },
+    ];
+    applyWith({ binding: () => ({ session: { events } }) });
+    const env = makeEnv();
+    seedLive(env, {
+      completed: null, openStepStart: step2Start, pendingMin: null, toolPhaseStart: null,
+      rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+      seedLength: 0
+    });
+    env.states[HOOK.hovered] = { value: true };
+    env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+    const projection = { uncachedInputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 25, outputTokens: 10, reasoningTokens: 0 };
+    const zeroStats = { turns: 1, steps: 1, llmMs: 1000, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 };
+    const makeProps = (running) => ({
+      useProjection: (key) => key === "tokenUsage" ? projection : zeroStats,
+      useSessions: () => ({ byId: { "session-test": { running } } }),
+      sessionId: "session-test",
+    });
+    const cacheValues = (el) => {
+      const pop = popTextOf(el);
+      const strip = groupTextsOf(el);
+      const turn = Number((pop.match(/本轮 缓存 (\d+)/) || [])[1]);
+      const session = Number((pop.match(/会话 缓存 (\d+)/) || [])[1]);
+      const stripCache = Number((strip.match(/缓存 (\d+) · 命中/) || [])[1]);
+      return { pop, strip, turn, session, stripCache };
+    };
+
+    const first = cacheValues(render(env, makeProps(true)));
+    check("cache animation: starts close to the predictor in all three views",
+      first.turn === 218 && first.session === 218 && first.stripCache === 218 &&
+        /本轮 输入 245 输出 10\b/.test(first.pop),
+      first.strip + " | " + first.pop);
+
+    let sameNow = first;
+    for (let ri = 0; ri < 12; ri++) sameNow = cacheValues(render(env, makeProps(true)));
+    check("cache animation: render/chunk count cannot accelerate wall time",
+      sameNow.turn === first.turn && sameNow.session === first.session && sameNow.stripCache === first.stripCache,
+      first.pop + " | after=" + sameNow.pop);
+
+    const timeline = [first.turn];
+    let liveAtOneSecond = first;
+    for (let ms = 100; ms <= 1000; ms += 100) {
+      fakeNow = step2Start + ms;
+      liveAtOneSecond = cacheValues(render(env, makeProps(true)));
+      timeline.push(liveAtOneSecond.turn);
+      check("cache animation frame " + ms + "ms: 本轮、会话 and strip stay identical",
+        liveAtOneSecond.turn === liveAtOneSecond.session && liveAtOneSecond.turn === liveAtOneSecond.stripCache,
+        liveAtOneSecond.strip + " | " + liveAtOneSecond.pop);
+    }
+    const distinctTimeline = [...new Set(timeline)];
+    check("cache animation: wall-clock ticks visibly and monotonically during streaming",
+      distinctTimeline.length >= 4 && timeline.every((value, index) => index === 0 || value >= timeline[index - 1]),
+      JSON.stringify(timeline));
+
+    fakeNow = step2Start + 8000;
+    const beforeSettle = cacheValues(render(env, makeProps(true)));
+    check("cache hand-off: provisional cache remains close to its predictor",
+      beforeSettle.turn === 224 && beforeSettle.session === 224 && beforeSettle.stripCache === 224,
+      beforeSettle.strip + " | " + beforeSettle.pop);
+
+    const stoppedPop = popTextOf(render(env, makeProps(false)));
+    check("estimate gate: abnormal stop clears provisional input/cache without end events",
+      /本轮 输入 125 输出 10\b/.test(stoppedPop) && /会话 输入 125 输出 10\b/.test(stoppedPop) &&
+        stoppedPop.indexOf("本轮 缓存 50 命中 28.57%") !== -1 &&
+        stoppedPop.indexOf("会话 缓存 50 命中 28.57%") !== -1,
+      stoppedPop);
+
+    const nextUsage = { inputTokens: 100, cacheReadTokens: 175, cacheWriteTokens: 25, outputTokens: 10, reasoningTokens: 0 };
+    events.push({ type: "assistant/message", data: { turn: 1, step: 2, usage: nextUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: fakeNow });
+    events.push({ type: "step/end", data: { turn: 1, step: 2 }, time: fakeNow });
+    events.push({ type: "turn/end", data: { turn: 1 }, time: fakeNow + 1 });
+    seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+    const settledPop = popTextOf(render(env, makeProps(false)));
+    check("cache hand-off: exact usage atomically replaces the provisional cache",
+      settledPop.indexOf("本轮 缓存 225 命中 47.37%") !== -1 &&
+        settledPop.indexOf("会话 缓存 225 命中 47.37%") !== -1 &&
+        settledPop.indexOf("本轮 输入 250 输出 20") !== -1 &&
+        settledPop.indexOf("会话 输入 250 输出 20") !== -1,
+      settledPop);
+  } finally {
+    Date.now = realNow;
+  }
 }
 
 // Scenario 57: an incomplete /today fold is a lower bound. It must neither
@@ -2295,6 +2362,663 @@ check("spliced child message does not hijack the parent's request route",
       storage["dsh-better-stats:eta"]);
   } finally {
     globalThis.fetch = realFetch;
+  }
+}
+
+// Scenario 58: DSH can expose the completed assistant message as a flat data
+// object instead of the historical data.message envelope. The exact message
+// must still replace the streaming estimate immediately and authoritatively.
+{
+  const t0 = Date.now() - 2000;
+  const exact = { inputTokens: 120, outputTokens: 40, cacheReadTokens: 20, cacheWriteTokens: 0, reasoningTokens: 10 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "provisional output that must be discarded" } }, time: t0 + 200 },
+    { type: "assistant/message", data: {
+      turn: 1, step: 1, usage: exact,
+      role: "assistant", content: [{ type: "text", text: "done" }],
+      source: { kind: "model", model: "deepseek-v4-pro" }
+    }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { type: "turn/end", data: { turn: 1 }, time: t0 + 1001 },
+  ];
+  applyWith({ binding: () => ({ session: { events, header: {} } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  }));
+  check("flat assistant message: exact usage replaces the provisional turn without disappearing",
+    /本轮 输入 120 输出 40\b/.test(pop) && pop.indexOf("本轮 ¥0.000000") === -1 &&
+      pop.indexOf("含估算 ¥0.000000") !== -1,
+    pop);
+  check("flat assistant message: final source overrides the request route",
+    pop.indexOf("v4-pro 花费 ¥") !== -1 && pop.indexOf("v4-flash 花费 ¥") === -1,
+    pop);
+  check("flat assistant message: settled timing and speed remain available",
+    pop.indexOf("本轮 LLM 1.0s") !== -1 && pop.indexOf("本轮 首 token 平均 0.2s") !== -1,
+    pop);
+}
+
+// Scenario 59: the client event stream leads the 1s /live poll. A real open
+// client step must expose its estimate immediately instead of showing zeros
+// until the first host response arrives.
+{
+  const t0 = Date.now() - 500;
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: ["x".repeat(250)] }, time: t0 + 100 },
+  ];
+  applyWith({ binding: () => ({ session: { events, header: {} } }) });
+  const env = makeEnv(); // live state intentionally remains null
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const el = render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    // The session-list row can lag the event binding during reconnect/mount.
+    // Unknown is not an explicit stopped state.
+    useSessions: () => ({ byId: {} }),
+    sessionId: "session-test",
+  });
+  const pop = popTextOf(el);
+  check("client-led live gate: estimate appears before the first /live response",
+    groupTextsOf(el).indexOf("本轮 ¥0.0000 · 会话 ¥0.0000") === -1 &&
+      /本轮 输入 0 输出 100\b/.test(pop) && pop.indexOf("含估算") !== -1,
+    groupTextsOf(el) + " | " + pop);
+}
+
+// Scenario 60: request/context can switch models before the next step opens.
+// Its provisional input/cache carry must use that new route, matching the
+// model row and the eventual producer instead of being priced on the prior
+// step's model.
+{
+  const t0 = Date.now() - 2000;
+  const prior = { inputTokens: 100, cacheReadTokens: 100, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: prior, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 + 1100 },
+    { type: "step/start", data: { turn: 1, step: 2 }, time: t0 + 1200 },
+  ];
+  applyWith({ binding: () => ({ session: { events, header: {} } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: t0 + 1200, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  }));
+  const peak = peakAt(Date.now());
+  const flashExact = (100 * (peak ? 3.0 : 1.5) + 100 * (peak ? 0.1 : 0.05)) / 1e6;
+  const proCarryFull = (100 * (peak ? 9.0 : 4.5) + 200 * (peak ? 0.3 : 0.15)) / 1e6;
+  const shownEstimate = (() => {
+    const match = pop.match(/含估算 ¥([\d.]+)/);
+    return match ? Number(match[1]) : NaN;
+  })();
+  check("model switch: provisional input/cache is priced on the active route",
+    Number.isFinite(shownEstimate) && shownEstimate > proCarryFull * 0.95 && shownEstimate < proCarryFull &&
+      pop.indexOf("本轮 ¥" + (flashExact + shownEstimate).toFixed(6)) !== -1 &&
+      pop.indexOf("v4-flash 花费 ¥") !== -1 && pop.indexOf("v4-pro 花费 ¥") !== -1,
+    pop);
+}
+
+// Scenario 61: long sessions expose a sequenced tail window. It can still
+// drive 本轮, but must never masquerade as the complete session root.
+{
+  const t0 = Date.now() - 1000;
+  const tailUsage = { inputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const tailEvents = [
+    { seq: 100, type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { seq: 101, type: "turn/start", data: { turn: 9 }, time: t0 },
+    { seq: 102, type: "step/start", data: { turn: 9, step: 1 }, time: t0 },
+    { seq: 103, type: "assistant/message", data: { turn: 9, step: 1, usage: tailUsage, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 500 },
+    { seq: 104, type: "step/end", data: { turn: 9, step: 1 }, time: t0 + 500 },
+    { seq: 105, type: "turn/end", data: { turn: 9 }, time: t0 + 501 },
+  ];
+  applyWith({ binding: () => ({ session: { events: tailEvents, header: { seedLength: 0 }, baseSeq: 100, hasMore: true } }) });
+  const env = makeEnv();
+  const hostUsage = { uncachedInputTokens: 1000, cacheReadTokens: 5000, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0 };
+  seedCost(env, {
+    merged: hostUsage, costCny: 0.5,
+    root: { costCny: 0.5, unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { costCny: 0, unpricedSteps: 0, invalidSteps: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: hostUsage, costCny: 0.5 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 0, persistenceAvailable: true, stale: false, pricing: null
+  });
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.9, eventRevision: 106, unpricedSteps: 0, invalidSteps: 0,
+    seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? hostUsage : { turns: 1, steps: 1, llmMs: 500, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  }));
+  check("tail window: current turn folds but incomplete root cannot override host session",
+    pop.indexOf("本轮 缓存 1000 命中 90.91%") !== -1 &&
+      pop.indexOf("会话 缓存 5000 命中 83.33%") !== -1 &&
+      pop.indexOf("会话 输入 1000 输出 100") !== -1 &&
+      pop.indexOf("会话 ¥0.500000") !== -1,
+    pop);
+}
+
+// Scenario 62: even without revisions, a newer complete client root and a
+// complete descendant tail must be selected as one bundle. A cost-only live
+// answer cannot mix its amount with stale /cost usage or models.
+{
+  const t0 = Date.now() - 1000;
+  const own = { inputTokens: 200, cacheReadTokens: 800, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: own, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 500 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 500 },
+    { type: "turn/end", data: { turn: 1 }, time: t0 + 501 },
+  ];
+  applyWith({ binding: () => ({ session: { events, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  const oldRoot = { uncachedInputTokens: 1, cacheReadTokens: 1, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0 };
+  const desc = { uncachedInputTokens: 20, cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 20, reasoningTokens: 0 };
+  const oldMerged = { uncachedInputTokens: 21, cacheReadTokens: 201, cacheWriteTokens: 0, outputTokens: 21, reasoningTokens: 0 };
+  seedCost(env, {
+    merged: oldMerged, costCny: 0.01001,
+    root: { usage: oldRoot, costCny: 0.00001, models: [{ model: "deepseek-v4-flash", usage: oldRoot, costCny: 0.00001 }], unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { usage: desc, costCny: 0.01, models: [{ model: "deepseek-v4-flash", usage: desc, costCny: 0.01 }], unpricedSteps: 0, invalidSteps: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: oldMerged, costCny: 0.01001 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 1, persistenceAvailable: true, stale: true, pricing: null
+  });
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.5, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false }, "child": { parentId: "session-test", origin: "subagent" } } }),
+    sessionId: "session-test",
+  }));
+  const peak = peakAt(Date.now());
+  const ownCost = (200 * (peak ? 9.0 : 4.5) + 800 * (peak ? 0.3 : 0.15) + 100 * (peak ? 27.0 : 13.5)) / 1e6;
+  check("legacy bundle: amount, Tok, cache and models use client root + one descendant tail",
+    pop.indexOf("会话 ¥" + (ownCost + 0.01).toFixed(6)) !== -1 &&
+      pop.indexOf("会话 缓存 1000 命中 81.97%") !== -1 &&
+      pop.indexOf("会话 输入 220 输出 120") !== -1 &&
+      pop.indexOf("v4-pro 花费 ¥") !== -1 && pop.indexOf("v4-flash 花费 ¥") !== -1 &&
+      pop.indexOf("会话 ¥0.500000") === -1,
+    pop);
+}
+
+// Scenario 63: loading older events prepends the sliding window and changes
+// its base. The incremental cursor must rebuild once, then promote the client
+// fold to a complete root without double-counting the old tail.
+{
+  const t0 = Date.now() - 2000;
+  const currentUsage = { inputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 0, outputTokens: 5, reasoningTokens: 0 };
+  const tail = [
+    { seq: 2, type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { seq: 3, type: "turn/start", data: { turn: 1 }, time: t0 },
+    { seq: 4, type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { seq: 5, type: "assistant/message", data: { turn: 1, step: 1, usage: currentUsage, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 500 },
+    { seq: 6, type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 500 },
+    { seq: 7, type: "turn/end", data: { turn: 1 }, time: t0 + 501 },
+  ];
+  const sessionWindow = { events: tail, header: { seedLength: 0 }, baseSeq: 2, hasMore: true };
+  applyWith({ binding: () => ({ session: sessionWindow }) });
+  const env = makeEnv();
+  const hostUsage = { uncachedInputTokens: 1, cacheReadTokens: 999, cacheWriteTokens: 0, outputTokens: 1, reasoningTokens: 0 };
+  seedCost(env, { merged: hostUsage, costCny: 0.000001,
+    root: { costCny: 0.000001, unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { costCny: 0, unpricedSteps: 0, invalidSteps: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: hostUsage, costCny: 0.000001 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 0, persistenceAvailable: true, stale: false, pricing: null });
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.000001, eventRevision: 8, unpricedSteps: 0, invalidSteps: 0,
+    seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? hostUsage : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  };
+  let pop = popTextOf(render(env, props));
+  check("window prepend: incomplete tail keeps host session while preserving 本轮",
+    pop.indexOf("本轮 缓存 20 命中 66.67%") !== -1 &&
+      pop.indexOf("会话 缓存 999 命中 99.90%") !== -1,
+    pop);
+  const historyUsage = { inputTokens: 100, cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 50, reasoningTokens: 0 };
+  sessionWindow.events = [
+    { seq: 0, type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 - 1000 },
+    { seq: 1, type: "assistant/message", data: { turn: 0, step: 1, usage: historyUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 - 500 },
+  ].concat(tail);
+  sessionWindow.baseSeq = 0;
+  sessionWindow.hasMore = false;
+  pop = popTextOf(render(env, props));
+  check("window prepend: base change rebuilds one complete root without duplicate tail",
+    pop.indexOf("本轮 缓存 20 命中 66.67%") !== -1 &&
+      pop.indexOf("会话 缓存 220 命中 66.67%") !== -1 &&
+      pop.indexOf("会话 输入 110 输出 55") !== -1 &&
+      pop.indexOf("v4-flash 花费 ¥") !== -1 && pop.indexOf("v4-pro 花费 ¥") !== -1,
+    pop);
+}
+
+// Scenario 64: model rows are attribution, never the session accounting
+// total. A partial legacy model breakdown must not erase exact Tok totals.
+{
+  applyWith({});
+  const env = makeEnv();
+  const exact = { uncachedInputTokens: 1000, cacheReadTokens: 500, cacheWriteTokens: 50, outputTokens: 200, reasoningTokens: 0 };
+  const partial = { uncachedInputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 20, reasoningTokens: 0 };
+  seedCost(env, {
+    merged: exact, costCny: 0.1,
+    root: { costCny: 0.1, unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { costCny: 0, unpricedSteps: 0, invalidSteps: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: partial, costCny: 0.1 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: true, failedSessionCount: 1,
+    descendantCount: 0, persistenceAvailable: true, stale: false, pricing: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? exact : { turns: 1, steps: 1, llmMs: 1, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  }));
+  check("Tok accounting: partial model rows never replace the exact session total",
+    pop.indexOf("会话 输入 1050 输出 200") !== -1 && pop.indexOf("会话 输入 100 输出 20") === -1,
+    pop);
+}
+
+// Scenario 65: /live can settle before the client binding catches up. The
+// open client estimate remains visible in 本轮 but is not added a second time
+// to the already-closed authoritative session root.
+{
+  const t0 = Date.now() - 3000;
+  const prior = { inputTokens: 100, cacheReadTokens: 100, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const events = [
+    { seq: 0, type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { seq: 1, type: "turn/start", data: { turn: 1 }, time: t0 },
+    { seq: 2, type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { seq: 3, type: "assistant/message", data: { turn: 1, step: 1, usage: prior, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { seq: 4, type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { seq: 5, type: "step/start", data: { turn: 1, step: 2 }, time: t0 + 2000 },
+  ];
+  applyWith({ binding: () => ({ session: { events, baseSeq: 0, hasMore: false, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  const hostExact = { uncachedInputTokens: 200, cacheReadTokens: 200, cacheWriteTokens: 0, outputTokens: 20, reasoningTokens: 0 };
+  seedLive(env, {
+    completed: { turns: 1, steps: 2, llmMs: 2000, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 1, rootUsage: hostExact,
+    models: [{ model: "deepseek-v4-flash", usage: hostExact, costCny: 1 }],
+    eventRevision: 7, seedLength: 0, unpricedSteps: 0, invalidSteps: 0,
+    pricing: { source: "official", version: 0, tables: HOST_TABLES, ledger: [] }, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  }));
+  check("host hand-off: closed ahead root suppresses only the duplicate session estimate",
+    /本轮 缓存 29\d/.test(pop) &&
+      pop.indexOf("会话 缓存 200 命中 50.00%") !== -1 &&
+      pop.indexOf("会话 输入 200 输出 20") !== -1 &&
+      pop.indexOf("会话 ¥1.000000") !== -1,
+    pop);
+}
+
+// Scenario 66: a continuously mounted fixed-size window can advance its base
+// while retaining the old absolute cursor. Keep all prior turn/cache samples
+// and fold only the new suffix.
+{
+  const t0 = Date.now() - 3000;
+  const prior = { inputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const initial = [
+    { seq: 0, type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { seq: 1, type: "turn/start", data: { turn: 1 }, time: t0 },
+    { seq: 2, type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { seq: 3, type: "assistant/message", data: { turn: 1, step: 1, usage: prior, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { seq: 4, type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { seq: 5, type: "step/start", data: { turn: 1, step: 2 }, time: t0 + 1500 },
+    { seq: 6, type: "text-chunks", data: { turn: 1, step: 2, texts: ["a".repeat(100)] }, time: t0 + 1800 },
+    { seq: 7, type: "text-chunks", data: { turn: 1, step: 2, texts: ["b".repeat(100)] }, time: t0 + 1900 },
+  ];
+  const window = { events: initial, baseSeq: 0, hasMore: false, header: { seedLength: 0 } };
+  applyWith({ binding: () => ({ session: window }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: t0 + 1500, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const before = popTextOf(render(env, props));
+  window.events = initial.slice(5).concat([
+    { seq: 8, type: "text-chunks", data: { turn: 1, step: 2, texts: ["c".repeat(100)] }, time: t0 + 2000 },
+    { seq: 9, type: "text-chunks", data: { turn: 1, step: 2, texts: ["d".repeat(100)] }, time: t0 + 2100 },
+  ]);
+  window.baseSeq = 5;
+  window.hasMore = true;
+  const after = popTextOf(render(env, props));
+  const beforeCache = Number((before.match(/本轮 缓存 (\d+)/) || [])[1]);
+  const afterCache = Number((after.match(/本轮 缓存 (\d+)/) || [])[1]);
+  check("window advance: absolute cursor preserves exact and provisional cache state",
+    Number.isFinite(beforeCache) && afterCache >= beforeCache && afterCache <= beforeCache + 1 && beforeCache > 2000 && beforeCache < 2100 &&
+      after.indexOf("会话 缓存 " + afterCache) !== -1 && /本轮 输入 19[78]/.test(after),
+    "before=" + before + " | after=" + after);
+}
+
+// Scenario 67: mounting directly into an incomplete live tail may omit the
+// turn/start (and even step/start). Recover the current turn from /live plus
+// the latest legal turn/step so the provisional cache/output does not vanish.
+{
+  const t0 = Date.now() - 2000;
+  const prior = { inputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const tail = [
+    { seq: 100, type: "assistant/message", data: { turn: 7, step: 1, usage: prior, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 },
+    { seq: 101, type: "step/end", data: { turn: 7, step: 1 }, time: t0 },
+    { seq: 102, type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 + 100 },
+    { seq: 103, type: "assistant/chunk", data: { turn: 7, step: 2, chunk: { type: "text-delta", text: "x".repeat(250) } }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events: tail, baseSeq: 100, hasMore: true, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: t0 + 200, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  }));
+  check("tail recovery: live chunk without turn/start/step:start restores 本轮 cache and output",
+    /本轮 缓存 [1-9]\d*/.test(pop) && /本轮 输入 [1-9]\d* 输出 [1-9]\d*/.test(pop),
+    pop);
+}
+
+// Scenario 68: the tail can finish its first fold before the first /live
+// response arrives. When openStepStart appears, retry that incomplete tail
+// once even if no new event was appended.
+{
+  const t0 = Date.now() - 2000;
+  const prior = { inputTokens: 100, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const tail = [
+    { seq: 100, type: "assistant/message", data: { turn: 7, step: 1, usage: prior, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 },
+    { seq: 101, type: "step/end", data: { turn: 7, step: 1 }, time: t0 },
+    { seq: 102, type: "assistant/chunk", data: { turn: 7, step: 2, chunk: { type: "text-delta", text: "x".repeat(250) } }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events: tail, baseSeq: 100, hasMore: true, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const before = popTextOf(render(env, props));
+  seedLive(env, { completed: null, openStepStart: t0 + 200, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  const after = popTextOf(render(env, props));
+  check("tail recovery: late /live edge replays the existing tail without a new event",
+    before.indexOf("本轮 缓存 0 命中 0.00%") !== -1 && /本轮 缓存 [1-9]\d*/.test(after) &&
+      /本轮 输入 [1-9]\d* 输出 [1-9]\d*/.test(after),
+    "before=" + before + " | after=" + after);
+}
+
+// Scenario 69: after a long response completes, an incomplete tail may retain
+// the final message/end markers but not turn/start. The last explicit turn/end
+// identifies the final root turn, so its exact usage must remain in 本轮.
+{
+  const t0 = Date.now() - 1000;
+  const exact = { inputTokens: 120, cacheReadTokens: 480, cacheWriteTokens: 0, outputTokens: 60, reasoningTokens: 10 };
+  const tail = [
+    { seq: 200, type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { seq: 201, type: "assistant/message", data: { turn: 9, step: 3, usage: exact, source: { model: "deepseek-v4-pro" }, content: [] }, time: t0 + 500 },
+    { seq: 202, type: "step/end", data: { turn: 9, step: 3 }, time: t0 + 500 },
+    { seq: 203, type: "turn/end", data: { turn: 9 }, time: t0 + 501 },
+  ];
+  applyWith({ binding: () => ({ session: { events: tail, baseSeq: 200, hasMore: true, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  const host = { uncachedInputTokens: 1000, cacheReadTokens: 5000, cacheWriteTokens: 0, outputTokens: 500, reasoningTokens: 0 };
+  seedCost(env, { merged: host, costCny: 1,
+    root: { costCny: 1, unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { costCny: 0, unpricedSteps: 0, invalidSteps: 0 },
+    models: [{ model: "deepseek-v4-flash", usage: host, costCny: 1 }],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 0, persistenceAvailable: true, stale: false, pricing: null });
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 1, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? host : { turns: 1, steps: 3, llmMs: 1000, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  }));
+  check("tail recovery: completed final turn keeps exact 本轮 while session stays host-authoritative",
+    pop.indexOf("本轮 缓存 480 命中 80.00%") !== -1 &&
+      pop.indexOf("本轮 输入 120 输出 60") !== -1 &&
+      pop.indexOf("会话 缓存 5000 命中 83.33%") !== -1,
+    pop);
+}
+
+// Scenario 70: current DSH list rows expose origin/parent but not seedLength.
+// A subagent must wait for /live's boundary instead of assuming seed 0 and
+// briefly showing the inherited parent prefix.
+{
+  const t0 = Date.now() - 3000;
+  const inherited = { inputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0 };
+  const own = { inputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 4, reasoningTokens: 0 };
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: inherited, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 500 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 500 },
+    { type: "turn/end", data: { turn: 1 }, time: t0 + 501 },
+    { type: "turn/start", data: { turn: 2 }, time: t0 + 1000 },
+    { type: "step/start", data: { turn: 2, step: 1 }, time: t0 + 1000 },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: own, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1500 },
+    { type: "step/end", data: { turn: 2, step: 1 }, time: t0 + 1500 },
+    { type: "turn/end", data: { turn: 2 }, time: t0 + 1501 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false, parentId: "parent", origin: "subagent" } } }),
+    sessionId: "session-test",
+  };
+  let pop = popTextOf(render(env, props));
+  check("subagent seed: missing list boundary never exposes inherited totals",
+    pop.indexOf("会话 输入 0 输出 0") !== -1 && pop.indexOf("v4-pro 花费 ¥") === -1,
+    pop);
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 5, pricing: null, budget: null });
+  pop = popTextOf(render(env, props));
+  check("subagent seed: authoritative boundary reveals only the child usage",
+    pop.indexOf("会话 输入 8 输出 4") !== -1 && pop.indexOf("v4-flash 花费 ¥") !== -1 &&
+      pop.indexOf("v4-pro 花费 ¥") === -1,
+    pop);
+}
+
+// Scenario 71: the final tail can arrive one render before the list row flips
+// from running to stopped. Re-evaluate the same events once on that edge so
+// the completed 本轮 does not remain zero forever.
+{
+  const t0 = Date.now() - 1000;
+  const exact = { inputTokens: 20, cacheReadTokens: 80, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const tail = [
+    { seq: 300, type: "assistant/message", data: { turn: 11, step: 2, usage: exact, source: { model: "deepseek-v4-flash" }, content: [] }, time: t0 + 500 },
+    { seq: 301, type: "step/end", data: { turn: 11, step: 2 }, time: t0 + 500 },
+    { seq: 302, type: "turn/end", data: { turn: 11 }, time: t0 + 501 },
+  ];
+  applyWith({ binding: () => ({ session: { events: tail, baseSeq: 300, hasMore: true, header: { seedLength: 0 } } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  let rowRunning = true;
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: rowRunning } } }),
+    sessionId: "session-test",
+  };
+  const before = popTextOf(render(env, props));
+  rowRunning = false;
+  const after = popTextOf(render(env, props));
+  check("tail recovery: running→stopped edge replays the unchanged final tail once",
+    before.indexOf("本轮 输入 0 输出 0") !== -1 &&
+      after.indexOf("本轮 缓存 80 命中 80.00%") !== -1 && after.indexOf("本轮 输入 20 输出 10") !== -1,
+    "before=" + before + " | after=" + after);
+}
+
+// Scenario 72: a brand-new session has no lastUsage carry. DSH publishes
+// contextBreakdown shortly after step/start but before the first output token;
+// seed that late projection once, animate it by wall time, then let exact
+// provider usage replace it atomically.
+{
+  const realNow = Date.now;
+  let fakeNow = realNow();
+  Date.now = () => fakeNow;
+  try {
+    const t0 = fakeNow;
+    let breakdown = null;
+    const events = [
+      { type: "turn/start", data: { turn: 1 }, time: t0 },
+      { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+      { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 + 2 },
+    ];
+    const session = { events };
+    applyWith({ binding: () => ({ session }) });
+    const env = makeEnv();
+    seedLive(env, { completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+      rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+    env.states[HOOK.hovered] = { value: true };
+    env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+    const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+    let running = true;
+    const props = {
+      useProjection: (key) => key === "tokenUsage" ? zero
+        : key === "contextBreakdown" ? breakdown
+        : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+      useSessions: () => ({ byId: { "session-test": { running } } }),
+      sessionId: "session-test",
+    };
+    const cacheValues = (el) => {
+      const pop = popTextOf(el);
+      const strip = groupTextsOf(el);
+      return {
+        pop, strip,
+        turn: Number((pop.match(/本轮 缓存 (\d+)/) || [])[1]),
+        session: Number((pop.match(/会话 缓存 (\d+)/) || [])[1]),
+        stripCache: Number((strip.match(/缓存 (\d+) · 命中/) || [])[1]),
+        input: Number((pop.match(/本轮 输入 (\d+)/) || [])[1])
+      };
+    };
+
+    const beforeProjection = cacheValues(render(env, props));
+    check("first-request fallback: step/start alone does not invent a cache prior",
+      beforeProjection.turn === 0 && beforeProjection.session === 0 && beforeProjection.stripCache === 0,
+      beforeProjection.strip + " | " + beforeProjection.pop);
+
+    // Real ordering: visible user messages reach the projection before
+    // request/header contributes the system/tool prefix. Do not freeze this
+    // partial frame or the cache prior would stay zero for the whole turn.
+    breakdown = { systemTokens: 0, toolsTokens: 0, messageTokens: 22 };
+    const beforeHeader = cacheValues(render(env, props));
+    check("first-request fallback: message-only partial projection waits for request header",
+      beforeHeader.turn === 0 && beforeHeader.session === 0 && beforeHeader.stripCache === 0,
+      beforeHeader.strip + " | " + beforeHeader.pop);
+
+    // Real fixture before its first output: 1513 system + 7955 tools + 652
+    // model-visible messages = 10120 estimated prompt tokens; exact was 10065.
+    breakdown = { systemTokens: 1513, toolsTokens: 7955, messageTokens: 652 };
+    const seeded = cacheValues(render(env, props));
+    check("first-request fallback: late context projection seeds all three cache views",
+      seeded.turn === 9089 && seeded.session === 9089 && seeded.stripCache === 9089 && seeded.input === 626,
+      seeded.strip + " | " + seeded.pop);
+
+    // The projection later grows with assistant surface text. The open
+    // request must keep its original input snapshot instead of chasing output.
+    breakdown = { systemTokens: 1513, toolsTokens: 7955, messageTokens: 5000 };
+    const frozen = cacheValues(render(env, props));
+    check("first-request fallback: seeded context snapshot ignores later assistant growth",
+      frozen.turn === seeded.turn && frozen.input === seeded.input,
+      "seeded=" + seeded.pop + " | frozen=" + frozen.pop);
+
+    const timeline = [seeded.turn];
+    let live = seeded;
+    for (let ms = 100; ms <= 1000; ms += 100) {
+      fakeNow = t0 + ms;
+      live = cacheValues(render(env, props));
+      timeline.push(live.turn);
+      check("first-request frame " + ms + "ms: 本轮、会话 and strip stay identical",
+        live.turn === live.session && live.turn === live.stripCache,
+        live.strip + " | " + live.pop);
+    }
+    check("first-request fallback: cache visibly advances by wall time",
+      new Set(timeline).size >= 4 && timeline.every((value, index) => index === 0 || value >= timeline[index - 1]),
+      JSON.stringify(timeline));
+
+    fakeNow = t0 + 8000;
+    const beforeSettle = cacheValues(render(env, props));
+    const exact = { inputTokens: 81, cacheReadTokens: 9984, cacheWriteTokens: 0, outputTokens: 2134, reasoningTokens: 1259 };
+    events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: exact } }, time: fakeNow });
+    events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: exact, message: { source: { model: "deepseek-v4-flash" } } }, time: fakeNow + 1 });
+    events.push({ type: "step/end", data: { turn: 1, step: 1 }, time: fakeNow + 1 });
+    events.push({ type: "turn/end", data: { turn: 1 }, time: fakeNow + 2 });
+    running = false;
+    seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+      rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: null, budget: null });
+    const settled = cacheValues(render(env, props));
+    check("first-request hand-off: exact cache/input replace the prior once",
+      beforeSettle.turn > 9000 && Math.abs(beforeSettle.turn - 9984) / 9984 < 0.1 &&
+        settled.turn === 9984 && settled.session === 9984 && settled.stripCache === 9984 && settled.input === 81 &&
+        settled.pop.indexOf("本轮 输入 81 输出 2134") !== -1 && settled.pop.indexOf("会话 输入 81 输出 2134") !== -1,
+      "before=" + beforeSettle.pop + " | settled=" + settled.pop);
+  } finally {
+    Date.now = realNow;
   }
 }
 

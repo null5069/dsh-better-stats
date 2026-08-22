@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.13 (2026-08-22)
+
+- **Strict accounting & snapshot consistency**: usage payloads validated
+  strictly (legal zero kept, malformed counted as invalid, never clamped),
+  output/reasoning semantics enforced (no double counting, live rate uses
+  settled output only), per-event model/peak-off-peak pricing, price
+  ledger pinned per request (request-immutable snapshots), cross-credential
+  balance-cache isolation, singleflight keyed by pricing version,
+  Beijing-date rollover, partial-read failures surfaced instead of silent,
+  and bad timestamps / live-rate inputs rejected.
+- **Session-tree semantics**: only `origin: subagent` descendants join the
+  parent tree — ordinary forks stay independent; every session excludes its
+  own `seedLength`; cyclic relations no longer re-add the root; spliced
+  subagent turns embedded in parent logs are no longer double billed or
+  allowed to pollute duration/model stats.
+- **Estimate → real handover idempotency**: usage chunks and the final
+  message replace estimates idempotently, char/fragment estimators are
+  cleaned up in time, and Token/amount/duration are never accumulated
+  twice; unknown models still show Token but stay unpriced.
+- **nested/flat message compatibility**: real flat `assistant/message`
+  events no longer drop the current turn's usage, model, calibration, or
+  open-step settlement.
+- **Event-stream correctness**: batch/delta dedupe, reason/text/tool
+  classification rollback, tool-call delta handling, strict event
+  numbering, spliced-turn isolation, fork seed rebuild, and a sliding
+  event window with absolute cursors and tail-window recovery.
+- **Revision-based merge**: host `/cost` + `/live` and the client fold pick
+  same-source cost/usage/models by event revision instead of guessing by
+  amount size — decreasing values and legal zeros merge correctly.
+- **Stability & perf**: poll re-entrancy guard, out-of-order response
+  handling, no duplicate today-ETA sampling, partial/stale budgets no
+  longer pollute figures, 100ms hot path dedupe, idle ticker, bounded
+  width cache, hidden-entry restore, and a single provisional overlay with
+  a deterministic monotonic wall-clock curve (renders no longer converge
+  the cache early or fake jitter).
+- **First-round prior**: subscribes to the official live
+  `contextBreakdown` projection — early half-baked projections (only
+  `messageTokens`, zero system/tools) are ignored until `request/header`
+  freezes a stable system/tool prefix; the request's input prior is frozen
+  then, later assistant output cannot pollute it, and real usage replaces
+  the estimate atomically in the same fold (~1% of the true input).
+- No UI strip/popover item added, removed, or reordered; zh/en strings
+  unchanged.
+
 ## 0.1.12 (2026-08-22)
 
 - **Smooth estimate → real usage handover**: simulated (estimated) Token /

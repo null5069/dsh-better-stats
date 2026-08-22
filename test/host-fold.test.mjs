@@ -122,6 +122,45 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     modelKeyOf(void 0) === "unknown" && modelKeyOf(null) === "unknown" && modelKeyOf(42) === "unknown");
 }
 
+// ── message envelope compatibility: flat and nested DSH projections ───────
+{
+  const snap = { tables: BUILTIN(), version: 0, ledger: [] };
+  const usage = { inputTokens: 0, outputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const flat = foldUsage([
+    { type: "assistant/message", time: OFF, data: {
+      turn: 1, step: 1, usage,
+      role: "assistant", content: [{ type: "text", text: "done" }],
+      source: { kind: "model", model: "deepseek-v4-pro" }
+    } }
+  ], { snapshot: snap });
+  const nested = foldUsage([
+    { type: "assistant/message", time: OFF, data: {
+      turn: 1, step: 1, usage,
+      message: { role: "assistant", content: [{ type: "text", text: "done" }], source: { kind: "model", model: "deepseek-v4-pro" } }
+    } }
+  ], { snapshot: snap });
+  check("flat assistant message keeps the producing model and exact price",
+    flat.unpricedSteps === 0 && flat.byModel.has("deepseek-v4-pro") &&
+    Math.abs(flat.costCny - 1000 * 13.5 / 1e6) < 1e-12,
+    JSON.stringify({ cost: flat.costCny, unpriced: flat.unpricedSteps, models: [...flat.byModel.keys()] }));
+  check("flat and nested assistant message envelopes fold identically",
+    flat.costCny === nested.costCny && JSON.stringify(flat.totals) === JSON.stringify(nested.totals),
+    JSON.stringify({ flat: flat.totals, nested: nested.totals }));
+
+  const seeded = foldUsage([
+    { type: "assistant/message", time: OFF - 2, data: {
+      turn: 1, step: 1, usage: { outputTokens: 999 },
+      source: { kind: "model", model: "deepseek-v4-pro" }, content: []
+    } },
+    { type: "assistant/chunk", time: OFF, data: {
+      turn: 2, step: 1, chunk: { type: "usage", usage: { outputTokens: 100 } }
+    } }
+  ], { snapshot: snap, startIndex: 1 });
+  check("flat seed source warms the post-seed usage route without billing the seed",
+    seeded.totals.outputTokens === 100 && seeded.unpricedSteps === 0 && seeded.byModel.has("deepseek-v4-pro"),
+    JSON.stringify({ totals: seeded.totals, unpriced: seeded.unpricedSteps, models: [...seeded.byModel.keys()] }));
+}
+
 // ── peak/off-peak boundaries ───────────────────────────────────────────────
 {
   check("beijingPeak boundaries",
@@ -579,6 +618,36 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     liveClosed.completed.steps === 1 && liveClosed.completed.decodeTokens === 10 &&
     liveClosed.completed.decodeMs === 3000 && liveClosed.completed.ttftMs === 1000,
     JSON.stringify(liveClosed));
+  const liveFlatMessages = foldLive([
+    { type: "step/start", time: 1000, data: { turn: 1, step: 1 } },
+    { type: "assistant/message", time: 2000, data: {
+      turn: 1, step: 1, usage: { outputTokens: 0 },
+      source: { kind: "model", model: "deepseek-v4-flash" },
+      content: [{ type: "tool-call", id: "flat-call", name: "read", arguments: "{}" }]
+    } },
+    { type: "tool/call", time: 2100, data: { turn: 1, step: 1, callId: "flat-call" } },
+    { type: "tool/result", time: 4100, data: {
+      turn: 1, step: 1,
+      source: { kind: "tool", callId: "flat-call" },
+      content: [{ type: "tool-result", toolCallId: "flat-call", content: [] }]
+    } },
+    { type: "step/end", time: 4200, data: { turn: 1, step: 1 } }
+  ]);
+  const liveFlatToolOpen = foldLive([
+    { type: "step/start", time: 1000, data: { turn: 1, step: 1 } },
+    { type: "assistant/message", time: 2000, data: {
+      turn: 1, step: 1, usage: { outputTokens: 0 },
+      source: { kind: "model", model: "deepseek-v4-flash" },
+      content: [{ type: "tool-call", id: "flat-call", name: "read", arguments: "{}" }]
+    } }
+  ]);
+  check("flat tool decision opens the live tool phase before results arrive",
+    liveFlatToolOpen.toolPhaseStart === 2000,
+    JSON.stringify(liveFlatToolOpen));
+  check("foldLive accepts flat tool decision/result messages",
+    liveFlatMessages.toolPhaseStart === null && liveFlatMessages.pendingMin === null &&
+    liveFlatMessages.completed.toolMs === 2000,
+    JSON.stringify(liveFlatMessages));
   // strict time validation: malformed event times are skipped, never NaN
   const liveBad = foldLive([
     { type: "step/start", data: { turn: 1, step: 1 } }, // no time
