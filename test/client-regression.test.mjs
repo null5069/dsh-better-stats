@@ -1461,5 +1461,138 @@ check("stats line caps at two rows with ellipsis style",
   check("popover carries the partial note", pop.indexOf("含 2 个子会话读取失败") !== -1, pop);
 }
 
+// Scenario 38: FIRST ROUND consistency — right after the first step settles,
+// the host root snapshot (/live 1s poll, /cost 10s cache) is still 0/stale
+// while the client's real-time fold already has the real cost. 会话 must
+// equal 本轮 from the settle moment (freshest exact fold wins), never ¥0.
+{
+  const liveEvents = [
+    { type: "turn/start", data: { turn: 1 }, time: Date.now() - 2000 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: Date.now() - 2000 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() - 1000 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() - 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: Date.now() - 1000 },
+    { type: "turn/end", data: { turn: 1 }, time: Date.now() - 1000 },
+  ];
+  applyWith({ binding: () => ({ session: { events: liveEvents } }) });
+  const env = makeEnv();
+  // host /live poll is STALE: it has not folded the just-settled step yet
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  // no /cost snapshot yet at all
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const strip = groupTextsOf(render(env, props));
+  const m = String(strip).match(/本轮 ¥([\d.]+) · 会话 ¥([\d.]+)/);
+  check("first round: 会话 == 本轮 (client fold fills the stale host poll)",
+    m !== null && Number(m[1]) > 0 && Math.abs(Number(m[1]) - Number(m[2])) < 0.00005,
+    strip);
+  const pop = popTextOf(render(env, props));
+  const pm = String(pop).match(/本轮 ¥([\d.]+)/);
+  const ps = String(pop).match(/会话 ¥([\d.]+)/);
+  check("first round: popover 会话 row matches 本轮 row",
+    pm !== null && ps !== null && Math.abs(Number(pm[1]) - Number(ps[1])) < 0.0000005,
+    pop);
+}
+
+// Scenario 39: session SWITCH-BACK must not spike tok/s. The remount folds
+// the existing history in ONE synchronous pass — if those replayed token
+// events stamped the wall anchors, the live window would only count the time
+// on the current page (numerator holds the whole step's fragments → rate
+// spikes to thousands, then slowly falls). Replayed steps must use the
+// SERVER-time window (real elapsed decode), and stay on it while streaming.
+{
+  const t0 = Date.now() - 30000; // the open step started 30s before the switch-back
+  const liveEvents = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    // batch chunks have NO time field — only sampled deltas carry ev.time
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: Array(100).fill("x") } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "hi" } }, time: t0 + 1000 },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: Array(200).fill("y") } },
+  ];
+  applyWith({ binding: () => ({ session: { events: liveEvents } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  let pop = popTextOf(render(env, props));
+  // 300 fragments × 1.01 over the REAL elapsed (~29s) ≈ 10 tok/s — the true
+  // average, NOT a wall-collapsed spike (would be thousands)
+  const m1 = String(pop).match(/本轮 首 token 平均 1\.0s ([\d.]+)tok\/s/);
+  check("switch-back: replayed open step uses the server-time window (no spike)",
+    m1 !== null && Number(m1[1]) > 5 && Number(m1[1]) < 50,
+    "rate=" + (m1 !== null ? m1[1] : "n/a"));
+  // the session keeps streaming AFTER the switch-back: new live fragments
+  // must not re-stamp the wall anchors for the replayed step either
+  const spin = Date.now();
+  while (Date.now() - spin < 10) { /* guarantee wall time advances */ }
+  liveEvents.push({ type: "text-chunks", data: { turn: 1, step: 1, texts: Array(50).fill("z") } });
+  pop = popTextOf(render(env, props));
+  const m2 = String(pop).match(/本轮 首 token 平均 1\.0s ([\d.]+)tok\/s/);
+  check("switch-back: live fragments after remount keep the server window",
+    m2 !== null && Number(m2[1]) > 5 && Number(m2[1]) < 50,
+    "rate=" + (m2 !== null ? m2[1] : "n/a"));
+}
+
 console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
+
+// Scenario 40: a FORKED session's 会话 must exclude the inherited SEED
+// exactly like the host root fold (startIndex: seedLength) — the seed's
+// usage belongs to the parent session, never to the child. The boundary
+// arrives via /live (seedLength); the session fold rebuilds around it.
+{
+  // events 0-1 are the SEED (parent's usage), events 2+ are the child's own
+  const liveEvents = [
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() - 4000 },
+    { type: "assistant/message", data: { turn: 1, step: 2, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() - 3000 },
+    { type: "turn/start", data: { turn: 2 }, time: Date.now() - 2000 },
+    { type: "step/start", data: { turn: 2, step: 1 }, time: Date.now() - 2000 },
+    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() - 1000 },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() - 1000 },
+    { type: "step/end", data: { turn: 2, step: 1 }, time: Date.now() - 1000 },
+    { type: "turn/end", data: { turn: 2 }, time: Date.now() - 1000 },
+  ];
+  applyWith({ binding: () => ({ session: { events: liveEvents } }) });
+  const env = makeEnv();
+  // the /live poll KNOWS the seed boundary (host folds from startIndex: seed)
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 2
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS),
+    useSessions: () => ({ byId: { "session-test": { running: false, parentId: "parent-x" } } }),
+    sessionId: "session-test",
+  };
+  const strip = groupTextsOf(render(env, props));
+  // 会话 = ONLY the child's own step (turn 2) — the two seed steps (turn 1)
+  // stay out; the strip shows 本轮 == 会话 (single own turn) while the seed
+  // usage would have doubled the amount if the boundary were ignored
+  const m = String(strip).match(/本轮 ¥([\d.]+) · 会话 ¥([\d.]+)/);
+  check("fork: 会话 excludes the seed (boundary from /live seedLength)",
+    m !== null && Number(m[2]) > 0 && Math.abs(Number(m[1]) - Number(m[2])) < 0.00005,
+    strip);
+  const pop = popTextOf(render(env, props));
+  check("fork: popover session row excludes the seed too",
+    /会话 ¥([\d.]+)/.test(pop) && pop.indexOf("会话 ¥" + m[1]) !== -1, pop);
+}

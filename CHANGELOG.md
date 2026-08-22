@@ -1,6 +1,30 @@
 # Changelog
 
-## 0.1.10 (unreleased — prepared, not yet published)
+## 0.1.11 (2026-08-22)
+
+- **first-round 本轮/会话 consistency**: 会话 no longer lags 本轮 right
+  after a step settles. The client now folds its own exact whole-session
+  cost (`sessCost` — the same usage events the host folds, priced per
+  sample at event time) and prefers the freshest exact figure while the
+  host polls are stale (1s /live, 10s /cost cache): in the first round,
+  会话 shows the real cost from the settle moment instead of ¥0.0000 for
+  up to a poll interval. A legal zero root is still a real answer (both
+  folds agree on unpriced steps) and the host root stays authoritative
+  whenever it is at least as fresh. Seed events are skipped like the host's
+  `startIndex: seed` fold — the boundary now travels in the /live payload
+  (`seedLength`), so a forked session's 会话 never includes the parent's
+  cost; the session fold rebuilds once the boundary lands.
+- **session switch-back tok/s spike**: switching away and back remounts
+  the strip, and the catch-up fold of the existing log used to stamp the
+  wall anchors with the FOLD time instead of the events' real arrival —
+  the live window only counted the time on the current page while the
+  numerator held the whole step's fragments (tok/s spiked to thousands and
+  slowly fell as the window grew). Replayed events (below the mount index)
+  now never stamp wall anchors and a step that began in the replay keeps
+  the server-time window for its whole life, so the rate equals the real
+  average immediately.
+
+## 0.1.10 (2026-08-21)
 
 - **rate settle drift fix**: the live decode window switched from the wall
   clock (`Date.now() − firstTokenTime`) to the **push-domain span**
