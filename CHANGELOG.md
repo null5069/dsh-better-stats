@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.12 (2026-08-22)
+
+- **Smooth estimate → real usage handover**: simulated (estimated) Token /
+  amount / duration figures hand over to settled usage without double
+  counting or sudden drops.
+- **Accounting correctness**: unknown models, model switches, usage
+  chunk/message replacement, and reasoning-subset double counting fixed;
+  event-version selection picks the newest data (amount decreases and legal
+  zero corrections respected).
+- **Seed/subagent isolation**: fork and subagent seeds and subagent events
+  embedded in parent logs are excluded exactly once — no double billing.
+- **Host robustness**: pricing snapshot pinned per query, cross-credential
+  cache isolation, concurrent-request dedupe, Beijing-date rollover, and
+  partial/stale summaries no longer pollute budget and ETA figures.
+- **Performance**: incremental fold, live cache, poll re-entrancy guard,
+  idle ticker, layout width cache, and hidden-item restore.
+- No UI strip/popover item added, removed, or reordered; zh/en strings
+  unchanged; README/config untouched.
+
 ## 0.1.11 (2026-08-22)
 
 - **first-round 本轮/会话 consistency**: 会话 no longer lags 本轮 right

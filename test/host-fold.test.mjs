@@ -92,6 +92,14 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     { type: "assistant/message", time: "not-a-time", data: { turn: 1, step: 1, usage: { outputTokens: 10 }, message: { source: { model: "deepseek-v4-flash" } } } }
   ], { snapshot: { tables: BUILTIN(), version: 0, ledger: [] } });
   check("invalid turn/step/time count into invalidSteps", f2.invalidSteps === 3 && f2.costCny === 0, JSON.stringify(f2));
+  const preserved = foldUsage([
+    { type: "request/context", time: OFF - 2, data: { provider: "deepseek", model: "deepseek-v4-flash" } },
+    { type: "assistant/chunk", time: OFF - 1, data: { turn: 1, step: 1, chunk: { type: "usage", usage: { outputTokens: 100 } } } },
+    { type: "assistant/message", time: "not-a-time", data: { turn: 1, step: 1, usage: { outputTokens: 200 }, message: { source: { model: "deepseek-v4-flash" } } } }
+  ], { snapshot: { tables: BUILTIN(), version: 0, ledger: [] }, sinceMs: OFF - 10 });
+  check("invalid final time is reported without erasing the latest valid estimate",
+    preserved.invalidSteps === 1 && preserved.totals.outputTokens === 100 && preserved.costCny > 0,
+    JSON.stringify(preserved));
   // every legal fixture fold upholds 0 <= reasoning <= output
   let subsetOk = true;
   for (const [id, s] of Object.entries(fixtures)) {
@@ -123,6 +131,13 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     beijingPeak(Date.UTC(2026, 7, 18, 5, 59)) === false && // 13:59 BJ
     beijingPeak(Date.UTC(2026, 7, 18, 6, 0)) === true && // 14:00 BJ
     beijingPeak(Date.UTC(2026, 7, 18, 10, 0)) === false); // 18:00 BJ
+  const realNow = Date.now;
+  Date.now = () => PEAK;
+  try {
+    check("beijingPeak treats epoch 0 as a real timestamp", beijingPeak(0) === false);
+  } finally {
+    Date.now = realNow;
+  }
   const buckets = { uncachedInputTokens: 1000, cacheReadTokens: 1000, cacheWriteTokens: 0, outputTokens: 1000 };
   const costOff = priceBuckets(buckets, OFF, "deepseek-v4-flash", BUILTIN());
   const costPeak = priceBuckets(buckets, PEAK, "deepseek-v4-flash", BUILTIN());
@@ -172,6 +187,102 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     JSON.stringify({ totals: cFold.totals, costCny: cFold.costCny }));
 }
 
+// ── request route model: failed attempts + inherited seed state ───────────
+{
+  const snap = { tables: BUILTIN(), version: 0, ledger: [] };
+  const failedAttempt = foldUsage([
+    { type: "request/context", time: OFF - 1, data: { provider: "deepseek", model: "deepseek-v4-pro", contextWindow: 64000 } },
+    { type: "assistant/chunk", time: OFF, data: { turn: 7, step: 1, chunk: { type: "usage", usage: { outputTokens: 1000 } } } }
+  ], { snapshot: snap });
+  check("request/context prices a usage-only failed attempt with its routed model",
+    failedAttempt.unpricedSteps === 0 && failedAttempt.byModel.has("deepseek-v4-pro") &&
+    Math.abs(failedAttempt.costCny - 0.0135) < 1e-12,
+    JSON.stringify({ cost: failedAttempt.costCny, models: [...failedAttempt.byModel.keys()] }));
+
+  const headerAttempt = foldUsage([
+    { type: "request/header", time: OFF - 1, data: { header: { config: { provider: "deepseek", model: "deepseek-v4-flash" } } } },
+    { type: "assistant/chunk", time: OFF, data: { turn: 8, step: 1, chunk: { type: "usage", usage: { outputTokens: 1000 } } } }
+  ], { snapshot: snap });
+  check("request/header reads the model from data.header.config.model",
+    headerAttempt.unpricedSteps === 0 && headerAttempt.byModel.has("deepseek-v4-flash") &&
+    Math.abs(headerAttempt.costCny - 0.0045) < 1e-12,
+    JSON.stringify({ cost: headerAttempt.costCny, models: [...headerAttempt.byModel.keys()] }));
+
+  const seededRoute = foldUsage([
+    { type: "request/context", time: OFF - 2, data: { provider: "deepseek", model: "deepseek-v4-pro" } },
+    { type: "assistant/chunk", time: OFF, data: { turn: 9, step: 1, chunk: { type: "usage", usage: { outputTokens: 1000 } } } }
+  ], { snapshot: snap, startIndex: 1 });
+  check("seed prefix warms route state without billing the prefix",
+    seededRoute.totals.outputTokens === 1000 && seededRoute.unpricedSteps === 0 &&
+    seededRoute.byModel.has("deepseek-v4-pro") && Math.abs(seededRoute.costCny - 0.0135) < 1e-12,
+    JSON.stringify({ totals: seededRoute.totals, cost: seededRoute.costCny }));
+}
+
+// ── spliced subagent transcript: root fold must stay root-only ─────────────
+{
+  const snap = { tables: BUILTIN(), version: 0, ledger: [] };
+  const spliced = [
+    { type: "turn/start", time: OFF - 10000, data: { turn: 1 } },
+    { type: "step/start", time: OFF - 9000, data: { turn: 1, step: 1 } },
+    { type: "request/context", time: OFF - 8500, data: { provider: "deepseek", model: "deepseek-v4-flash" } },
+    { type: "tool/call", time: OFF - 8000, data: { turn: 1, step: 1, callId: "parent-call" } },
+    // Complete child turn spliced into the still-active parent turn. Its
+    // request/context and tool events deliberately omit turn coordinates.
+    { type: "turn/start", time: OFF - 7000, data: { turn: 7 } },
+    { type: "request/context", time: OFF - 6900, data: { provider: "deepseek", model: "deepseek-v4-pro" } },
+    { type: "step/start", time: OFF - 6800, data: { turn: 7, step: 1 } },
+    { type: "assistant/chunk", time: OFF - 6500, data: { turn: 7, step: 1, chunk: { type: "usage", usage: { outputTokens: 40 } } } },
+    { type: "assistant/message", time: OFF - 6000, data: { turn: 7, step: 1, usage: { outputTokens: 40 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "tool/call", time: OFF - 5900, data: { callId: "child-call" } },
+    { type: "tool/result", time: OFF - 5800, data: { message: { source: { callId: "parent-call" } } } },
+    { type: "step/end", time: OFF - 5700, data: { turn: 7, step: 1 } },
+    { type: "turn/end", time: OFF - 5600, data: { turn: 7 } },
+    // Parent resumes without an assistant/message (usage-only failed attempt).
+    { type: "assistant/chunk", time: OFF, data: { turn: 1, step: 1, chunk: { type: "usage", usage: { outputTokens: 10 } } } }
+  ];
+  const rootUsage = foldUsage(spliced, { snapshot: snap });
+  check("spliced child route/source/usage do not enter the parent usage fold",
+    rootUsage.totals.outputTokens === 10 && rootUsage.unpricedSteps === 0 &&
+    rootUsage.byModel.size === 1 && rootUsage.byModel.has("deepseek-v4-flash") &&
+    Math.abs(rootUsage.costCny - 10 * 4.5 / 1e6) < 1e-12,
+    JSON.stringify({ totals: rootUsage.totals, models: [...rootUsage.byModel.keys()], cost: rootUsage.costCny }));
+
+  const rootLive = foldLive(spliced);
+  check("spliced child boundaries/tools do not close or time the parent step",
+    rootLive.completed.turns === 0 && rootLive.completed.steps === 0 &&
+    rootLive.completed.llmMs === 0 && rootLive.completed.toolMs === 0 &&
+    rootLive.openStepStart === OFF - 9000 && rootLive.pendingMin === OFF - 8000,
+    JSON.stringify(rootLive));
+
+  const seededOwnTurn = foldUsage([
+    { type: "turn/start", time: OFF - 4, data: { turn: 1 } },
+    { type: "request/context", time: OFF - 3, data: { provider: "deepseek", model: "deepseek-v4-flash" } },
+    { type: "turn/start", time: OFF - 2, data: { turn: 7 } },
+    { type: "assistant/chunk", time: OFF, data: { turn: 7, step: 1, chunk: { type: "usage", usage: { outputTokens: 40 } } } }
+  ], { snapshot: snap, startIndex: 2 });
+  check("seed parent turn only warms route and cannot hide the child's own turn",
+    seededOwnTurn.totals.outputTokens === 40 && seededOwnTurn.byModel.has("deepseek-v4-flash"),
+    JSON.stringify({ totals: seededOwnTurn.totals, models: [...seededOwnTurn.byModel.keys()] }));
+
+  const childEvents = [
+    { type: "turn/start", time: OFF - 7000, data: { turn: 7 } },
+    { type: "step/start", time: OFF - 6800, data: { turn: 7, step: 1 } },
+    { type: "assistant/message", time: OFF - 6000, data: { turn: 7, step: 1, usage: { outputTokens: 40 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "step/end", time: OFF - 5700, data: { turn: 7, step: 1 } },
+    { type: "turn/end", time: OFF - 5600, data: { turn: 7 } }
+  ];
+  const treeCtx = fakeCtx([
+    { header: { id: "splice-root" }, events: spliced },
+    { header: { id: "splice-child", origin: "subagent", parentSession: "splice-root" }, events: childEvents }
+  ]);
+  const { queryTreeCost } = await import("../lib/index.js");
+  const tree = await queryTreeCost(treeCtx, null, "splice-root", undefined, snap);
+  check("tree fold counts the spliced child exactly once via its own session",
+    tree.root.usage.outputTokens === 10 && tree.descendants.usage.outputTokens === 40 &&
+    tree.merged.outputTokens === 50 && tree.descendantCount === 1,
+    JSON.stringify({ root: tree.root.usage, descendants: tree.descendants.usage, merged: tree.merged }));
+}
+
 // ── fork/subagent tree: origin gate + nesting + parallel + cycles ─────────
 {
   const byId = indexHeaders(
@@ -197,6 +308,18 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     JSON.stringify(cycleDesc) === JSON.stringify(["B"]), JSON.stringify(cycleDesc));
   // two-level nesting: grandchild's parent is subagent-a
   check("two-level nesting order", byId["session-grandchild"].parentId === "session-subagent-a");
+
+  const suppliedTarget = {};
+  indexHeaders([
+    { id: "__proto__", header: { id: "__proto__" } },
+    { id: "constructor", header: { id: "constructor", origin: "subagent", parentSession: "__proto__" } }
+  ], [], suppliedTarget);
+  const specialDesc = collectDescendantIds(suppliedTarget, "__proto__");
+  check("prototype-shaped session ids stay own indexed keys",
+    Object.prototype.hasOwnProperty.call(suppliedTarget, "__proto__") &&
+    Object.prototype.hasOwnProperty.call(suppliedTarget, "constructor") &&
+    JSON.stringify(specialDesc) === JSON.stringify(["constructor"]),
+    JSON.stringify({ keys: Object.keys(suppliedTarget), desc: specialDesc }));
 }
 
 // ── whole-tree snapshot via the production query path ─────────────────────
@@ -241,6 +364,18 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     forkSnap.root.usage.outputTokens === 300 && forkSnap.descendantCount === 0 &&
     Math.abs(forkSnap.costCny - 0.003) < 1e-12,
     JSON.stringify({ root: forkSnap.root.usage, cost: forkSnap.costCny }));
+
+  const specialSession = { events: [], header: { id: "__proto__" } };
+  const specialCtx = {
+    sessions: {
+      list: () => [], // exercise the get() fallback, not only header indexing
+      get: (id) => id === "__proto__" ? specialSession : void 0
+    }
+  };
+  const specialSnap = await queryTreeCost(specialCtx, null, "__proto__", undefined);
+  check("tree query accepts a prototype-shaped root id",
+    specialSnap.found === true && specialSnap.rootReadFailed === false && specialSnap.rootEventRevision === 0,
+    JSON.stringify(specialSnap));
 }
 
 // ── partial persistence accounting ─────────────────────────────────────────
@@ -300,6 +435,40 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     tf.version === 1 && tf.approx === false, JSON.stringify(tf));
 }
 
+// ── request-scoped pricing/event snapshot ─────────────────────────────────
+{
+  const { queryTreeCost } = await import("../lib/index.js");
+  const cheap = { ...BUILTIN(), "deepseek-v4-flash": { ...BUILTIN()["deepseek-v4-flash"], out: 1, outPeak: 2 } };
+  const supplied = { tables: cheap, version: 77, ledger: [{ effectiveAt: 0, version: 77, tables: cheap }] };
+  const session = {
+    header: { id: "snapshot-root" },
+    events: [
+      { type: "assistant/message", time: OFF, data: { turn: 1, step: 1, usage: { outputTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+    ]
+  };
+  const ctx = {
+    sessions: {
+      list: () => [{ id: "snapshot-root", header: session.header }],
+      get: (id) => id === "snapshot-root" ? session : void 0
+    }
+  };
+  const inFlight = queryTreeCost(ctx, null, "snapshot-root", undefined, supplied);
+  session.events.push(
+    { type: "assistant/message", time: OFF + 1, data: { turn: 1, step: 2, usage: { outputTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } }
+  );
+  const first = await inFlight;
+  check("tree query keeps one event revision while the live log appends",
+    first.rootEventRevision === 1 && first.eventRevision === 1 && first.root.usage.outputTokens === 1000,
+    JSON.stringify({ rootRevision: first.rootEventRevision, revision: first.eventRevision, usage: first.root.usage }));
+  check("tree query uses its supplied pricing snapshot consistently",
+    first.pricingVersion === 77 && Math.abs(first.costCny - 0.001) < 1e-12,
+    JSON.stringify({ version: first.pricingVersion, cost: first.costCny }));
+  const second = await queryTreeCost(ctx, null, "snapshot-root", undefined, supplied);
+  check("the next tree query observes the appended revision",
+    second.rootEventRevision === 2 && second.eventRevision === 2 && second.root.usage.outputTokens === 2000,
+    JSON.stringify({ rootRevision: second.rootEventRevision, revision: second.eventRevision, usage: second.root.usage }));
+}
+
 // ── all-unknown: tokens total, cost exactly ¥0 (legal zero) ────────────────
 {
   const f = foldUsage([
@@ -340,6 +509,24 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
   } finally {
     Date.now = RealDateNow;
   }
+}
+
+// A listed session that cannot be read is missing data, not an empty session.
+{
+  const { queryToday } = await import("../lib/index.js");
+  const missingCtx = {
+    sessions: {
+      list: () => [{ id: "missing-session", header: { id: "missing-session" } }],
+      get: () => void 0
+    }
+  };
+  const today = await queryToday(missingCtx, null, undefined,
+    { tables: BUILTIN(), version: 91, ledger: [] }, Date.UTC(2026, 7, 18, 7, 0));
+  check("today marks a listed-but-unreadable session as partial",
+    today.partial === true && today.failedSessionCount === 1 &&
+    JSON.stringify(today.failedSessionIds) === JSON.stringify(["missing-session"]) &&
+    today.foldedSessionCount === 0 && today.sessionCount === 0 && today.pricingVersion === 91,
+    JSON.stringify(today));
 }
 
 // ── pricing parser ─────────────────────────────────────────────────────────
@@ -408,6 +595,37 @@ const PEAK = Date.UTC(2026, 7, 18, 1, 0); // 09:00 Beijing — peak
     liveBad.completed.decodeMs === 3000 && liveBad.completed.decodeTokens === 10 &&
     Object.values(liveBad.completed).every((v) => Number.isFinite(v)),
     JSON.stringify(liveBad));
+
+  let malformedLive = null;
+  let malformedError = null;
+  try {
+    malformedLive = foldLive([
+      { type: "step/start", time: 1000, data: { turn: 1, step: 1 } },
+      { type: "step/start", time: 1200, data: null },
+      { type: "assistant/chunk", time: 1500, data: null },
+      { type: "assistant/chunk", time: 1600, data: { turn: 1, step: 1, chunk: null } },
+      { type: "assistant/chunk", time: 1700, data: { turn: 1, step: 1, chunk: { type: "tool-call-delta" } } },
+      { type: "assistant/chunk", time: 2000, data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "ok" } } },
+      { type: "step/end", time: 3000, data: null },
+      { type: "assistant/message", time: 5000, data: { turn: 1, step: 1, usage: { outputTokens: Infinity } } },
+      { type: "tool/call", time: 5500, data: null },
+      { type: "tool/result", time: 5600, data: { message: { source: { callId: "constructor" } } } },
+      { type: "tool/call", time: 6000, data: { callId: "__proto__" } },
+      { type: "tool/call", time: 6500, data: { callId: "__proto__" } },
+      { type: "tool/result", time: 8000, data: { message: { source: { callId: "__proto__" } } } },
+      { type: "step/end", time: 8100, data: null },
+      { type: "step/end", time: 8200, data: { turn: 1, step: 1 } }
+    ]);
+  } catch (error) {
+    malformedError = error;
+  }
+  check("foldLive tolerates null chunks/data and prototype-shaped tool ids",
+    malformedError === null && malformedLive !== null &&
+    malformedLive.completed.ttftMs === 1000 && malformedLive.completed.ttftSteps === 1 &&
+    malformedLive.completed.decodeMs === 0 && malformedLive.completed.decodeTokens === 0 &&
+    malformedLive.completed.toolMs === 2000 && malformedLive.completed.steps === 1 &&
+    malformedLive.pendingMin === null && Object.values(malformedLive.completed).every((v) => Number.isFinite(v)),
+    malformedError !== null ? String(malformedError) : JSON.stringify(malformedLive));
 }
 
 // ── helper factories ───────────────────────────────────────────────────────

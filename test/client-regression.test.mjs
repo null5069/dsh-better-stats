@@ -220,7 +220,7 @@ function render(env, props) {
 const HOOK = {
   balance: 0, hovered: 1, anchor: 2,
   today: 13, cost: 14, live: 16,
-  sepState: 27, itemRefs: 29, probe: 30, measure: 31, lineRef: 32
+  layout: 23, sepState: 27, itemRefs: 29, probe: 30, measure: 31, lineRef: 32
 };
 function seedLive(env, body) { env.states[HOOK.live] = { value: body }; }
 function seedCost(env, body) { env.states[HOOK.cost] = { value: body }; }
@@ -451,6 +451,38 @@ function flashRead(now) { return peakAt(now) ? 0.1 : 0.05; }
     "itemRef=" + JSON.stringify(itemRef.current.map((e) => e && e.idx)));
 }
 
+// Scenario 6b: a group hidden by the two-row ellipsis can become shorter
+// while it has no DOM ref. A changed signature must probe/reveal it instead of
+// reusing the old wide cache forever.
+{
+  applyWith({});
+  const env = makeEnv();
+  let turns = 999;
+  const dynamicProps = {
+    ...propsWithData,
+    useProjection: (key) => key === "tokenUsage" ? TOKEN_USAGE : { ...SESSION_STATS, turns }
+  };
+  render(env, dynamicProps);
+  env.states[HOOK.lineRef].current = { clientWidth: 170 };
+  env.states[HOOK.probe].current = { offsetWidth: 20 };
+  [80, 90, 70, 60, 50, 40, 30].forEach((width, i) => {
+    env.states[HOOK.itemRefs].current[i] = { offsetWidth: width, idx: i };
+  });
+  env.states[HOOK.measure].current();
+  const oldOmit = env.states[HOOK.layout].value.omitFrom;
+  render(env, dynamicProps);
+  for (let i = oldOmit; i < env.states[HOOK.itemRefs].current.length; i++) {
+    env.states[HOOK.itemRefs].current[i] = null;
+  }
+  turns = 0;
+  render(env, dynamicProps); // changed hidden signature schedules a 1px probe
+  const recovered = render(env, dynamicProps); // apply the probe layout
+  check("hidden shorter group is probed and restored from behind ellipsis",
+    oldOmit === 2 && env.states[HOOK.layout].value.omitFrom > oldOmit &&
+      groupTextsOf(recovered).indexOf("0 轮 · 12 步") !== -1,
+    "old=" + oldOmit + " new=" + JSON.stringify(env.states[HOOK.layout].value) + " text=" + groupTextsOf(recovered));
+}
+
 // Scenario 10: the strip caps at two rows with an ellipsis marker
 check("stats line caps at two rows with ellipsis style",
   code.includes("max-height:48px;overflow:hidden") && code.includes("dsh-better-stats-ellipsis") &&
@@ -618,8 +650,8 @@ check("stats line caps at two rows with ellipsis style",
     t2.indexOf("本轮 ¥0.0000") !== -1 && t2.indexOf("(估)") === -1, t2);
   // usage chunk lands → exact fold takes over; estAccuracy self-calibrates
   // (real 8000 ÷ est 2745.657 ≈ 2.9137 → EMA 0.3 → acc ≈ 1.5741)
-  events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 } } } });
-  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 }, message: { source: { model: "deepseek-v4-flash" } } } });
+  events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 } } }, time: Date.now() });
+  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 8000, cacheReadTokens: 5000 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() });
   const step1Exact = (100 * flashMiss(now) + 5000 * flashRead(now) + 8000 * outP) / 1e6;
   const t3 = groupTextsOf(render(env, runningProps));
   check("estimate removed after usage lands (exact turn fold shown)", t3.indexOf("(估)") === -1 && Math.abs(cnyOf(t3) - step1Exact) < 0.0051, t3 + " expected " + step1Exact.toFixed(2));
@@ -644,7 +676,7 @@ check("stats line caps at two rows with ellipsis style",
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["a".repeat(3500)] } },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 1, step: 1 } },
     { type: "step/start", data: { turn: 1, step: 2 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["b".repeat(700)] } }
@@ -680,7 +712,7 @@ check("stats line caps at two rows with ellipsis style",
   check("turn/start resets the exact base (本轮 = new turn only)", t2.indexOf("(估)") === -1 && Math.abs(cnyOf(t2) - turn2Shown) < 0.0051, t2 + " expected " + turn2Shown.toFixed(2));
   const histEvents = [
     { type: "step/start", data: { turn: 9, step: 1 } },
-    { type: "assistant/message", data: { turn: 9, step: 1, usage: { inputTokens: 9000, outputTokens: 9000, cacheReadTokens: 9000 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "assistant/message", data: { turn: 9, step: 1, usage: { inputTokens: 9000, outputTokens: 9000, cacheReadTokens: 9000 }, message: { source: { model: "deepseek-v4-pro" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 9, step: 1 } }
   ];
   applyWith({ binding: () => ({ session: { events: histEvents } }) });
@@ -746,8 +778,8 @@ check("stats line caps at two rows with ellipsis style",
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["q".repeat(7000)] } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 0, cacheReadTokens: 500, reasoningTokens: 1000 } } } },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 0, cacheReadTokens: 500, reasoningTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 1000, cacheReadTokens: 500, reasoningTokens: 1000 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 1000, cacheReadTokens: 500, reasoningTokens: 1000 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 1, step: 1 } },
     { type: "step/start", data: { turn: 1, step: 2 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 2, texts: ["r".repeat(700)] } }
@@ -768,10 +800,9 @@ check("stats line caps at two rows with ellipsis style",
   const outP = flashOut(now);
   // EMA density: 0.7*3.5 + 0.3*(7000/1000) = 4.55
   const adaptedDensity = 0.5 * 3.5 + 0.5 * (7000 / 1000);
-  // reasoning 1000 billed at output rate — output=0 reasoning=1000 is the
-  // illegal subset the OLD contract billed; new contract: outputTokens is
-  // billed (0 here), reasoning is display-only → step cost = input only
-  const step1Exact = (100 * missP + 500 * readP + 0 * outP) / 1e6;
+  // reasoningTokens is a legal subset of outputTokens; the shared 1000
+  // output tokens are billed once, never once again as reasoning.
+  const step1Exact = (100 * missP + 500 * readP + 1000 * outP) / 1e6;
   const inputCarry = (100 * missP + 500 * readP) / 1e6;
   const expected = step1Exact + inputCarry + 700 / adaptedDensity * outP / 1e6;
   const t = groupTextsOf(render(env, runningProps));
@@ -830,7 +861,7 @@ check("stats line caps at two rows with ellipsis style",
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
     { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["s".repeat(700)] } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 } } } }
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 } } }, time: Date.now() }
   ];
   applyWith({ binding: () => ({ session: { events } }) });
   const env = makeEnv();
@@ -847,7 +878,7 @@ check("stats line caps at two rows with ellipsis style",
     /本轮 ¥0\.00/.test(t) && t.indexOf("(估)") === -1, t);
   // the message (with usage + model) lands → same turn:step re-folds at the
   // model's price; reasoning is a subset of output and is NOT billed again
-  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 }, message: { source: { model: "deepseek-v4-flash" } } } });
+  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 100, outputTokens: 4000, cacheReadTokens: 500, reasoningTokens: 200 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() });
   const now = Date.now();
   const step1 = (100 * flashMiss(now) + 500 * flashRead(now) + 4000 * flashOut(now)) / 1e6;
   const t2 = groupTextsOf(render(env, runningProps));
@@ -1008,8 +1039,8 @@ check("stats line caps at two rows with ellipsis style",
   const events = [
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 10000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 10000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 10000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 10000, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 1, step: 1 } },
   ];
   applyWith({ binding: () => ({ session: { events } }) });
@@ -1053,20 +1084,20 @@ check("stats line caps at two rows with ellipsis style",
   const steps = [
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 1, step: 1 } },
     { type: "turn/end", data: { turn: 1 } },
     { type: "turn/start", data: { turn: 2 } },
     { type: "step/start", data: { turn: 2, step: 1 } },
     { type: "text-chunks", data: { texts: ["hello world, first step streaming now"] } },
-    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "usage", usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 2, step: 1, usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "usage", usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 2, step: 1 } },
     { type: "step/start", data: { turn: 2, step: 2 } },
     { type: "text-chunks", data: { texts: ["second step still streaming along nicely"] } },
-    { type: "assistant/chunk", data: { turn: 2, step: 2, chunk: { type: "usage", usage: { inputTokens: 350, outputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 2, step: 2, usage: { inputTokens: 350, outputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "assistant/chunk", data: { turn: 2, step: 2, chunk: { type: "usage", usage: { inputTokens: 350, outputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 2, step: 2, usage: { inputTokens: 350, outputTokens: 60, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 2, step: 2 } },
     { type: "turn/end", data: { turn: 2 } },
   ];
@@ -1117,21 +1148,21 @@ check("stats line caps at two rows with ellipsis style",
   const steps = [
     { type: "turn/start", data: { turn: 1 } },
     { type: "step/start", data: { turn: 1, step: 1 } },
-    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 1, step: 1 } },
     { type: "turn/end", data: { turn: 1 } },
     { type: "turn/start", data: { turn: 2 } },
     { type: "step/start", data: { turn: 2, step: 1 } },
     // spliced subagent transcript mid-turn (its own turn/step numbering)
     { type: "step/start", data: { turn: 7, step: 1 } },
-    { type: "assistant/chunk", data: { turn: 7, step: 1, chunk: { type: "usage", usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 7, step: 1, usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } } },
+    { type: "assistant/chunk", data: { turn: 7, step: 1, chunk: { type: "usage", usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 7, step: 1, usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-flash" } } }, time: Date.now() },
     { type: "step/end", data: { turn: 7, step: 1 } },
     // parent's own stream continues
     { type: "text-chunks", data: { texts: ["pro streaming"] } },
-    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "usage", usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } } },
-    { type: "assistant/message", data: { turn: 2, step: 1, usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } } },
+    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "usage", usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 } } }, time: Date.now() },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: { inputTokens: 300, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } }, time: Date.now() },
   ];
   for (let n = 1; n <= steps.length; n++) {
     liveEvents.push(steps[n - 1]);
@@ -1319,15 +1350,18 @@ check("stats line caps at two rows with ellipsis style",
   pop = popTextOf(render(env, props));
   check("streaming: fragment cumulative rate ticks live from the first token",
     pop.indexOf("本轮 首 token 平均 1.0s " + rate1.toFixed(2) + "tok/s") !== -1, pop);
-  // step settles with output 100 + reasoning 600: the numerator must be
+  // step settles with output 100 including reasoning 60: the numerator must be
   // OUTPUT ONLY (100) — the old subset-double-count gave 160 → 80tok/s
-  liveEvents.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 600 }, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 3000 });
+  liveEvents.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: { inputTokens: 10, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 60 }, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 3000 });
   liveEvents.push({ type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 3000 });
-  pop = popTextOf(render(env, props));
+  const settledEl = render(env, props);
+  pop = popTextOf(settledEl);
   check("settled step: cumulative rate = REAL output tokens (100 ÷ 2s = 50.00, not 80.00)",
     /本轮 首 token 平均 1\.0s 50\.00tok\/s/.test(pop), pop);
   check("settled step: 本轮 and 会话 LLM agree (3s)",
     /本轮 LLM 3.0s/.test(pop) && /会话 LLM 3.0s/.test(pop), pop);
+  check("settled step: stale /live open edge is not added to completed LLM time",
+    groupTextsOf(settledEl).indexOf("LLM 3s") !== -1, groupTextsOf(settledEl));
 }
 
 // Scenario 33: session switch — the strip is keyed by sessionId so React
@@ -1554,9 +1588,6 @@ check("stats line caps at two rows with ellipsis style",
     "rate=" + (m2 !== null ? m2[1] : "n/a"));
 }
 
-console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
-process.exit(failures === 0 ? 0 : 1);
-
 // Scenario 40: a FORKED session's 会话 must exclude the inherited SEED
 // exactly like the host root fold (startIndex: seedLength) — the seed's
 // usage belongs to the parent session, never to the child. The boundary
@@ -1600,3 +1631,672 @@ process.exit(failures === 0 ? 0 : 1);
   check("fork: popover session row excludes the seed too",
     /会话 ¥([\d.]+)/.test(pop) && pop.indexOf("会话 ¥" + m[1]) !== -1, pop);
 }
+
+// Scenario 41: the exact usage chunk is the estimate hand-off point. The
+// host's /live answer may still report the step as open for one poll, but no
+// provisional chars/tokens/cost may survive or be counted again by message.
+{
+  const t0 = Date.now() - 2000;
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "request/context", data: { turn: 1, step: 1, model: "deepseek-v4-flash" }, time: t0 },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: ["x".repeat(250)] }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const zeroStats = { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage" ? zero : zeroStats),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const beforeEl = render(env, props);
+  const before = popTextOf(beforeEl);
+  const beforeStrip = groupTextsOf(beforeEl);
+  check("usage hand-off: a provisional output estimate exists before usage",
+    /本轮 输入 0 输出 100\b/.test(before), before);
+  check("request route prices and attributes the provisional estimate before usage",
+    cnyOf(beforeStrip) > 0 && before.indexOf("v4-flash 花费 ¥") !== -1,
+    beforeStrip + " | " + before);
+
+  const exactUsage = { inputTokens: 5, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 2 };
+  const settleTime = Date.now() - 100;
+  events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: exactUsage } }, time: NaN });
+  const malformedEl = render(env, props);
+  const malformedStrip = groupTextsOf(malformedEl);
+  const malformedPop = popTextOf(malformedEl);
+  check("usage hand-off: invalid sample metadata cannot erase a valid provisional estimate",
+    /本轮 输入 0 输出 100\b/.test(malformedPop) && cnyOf(malformedStrip) === cnyOf(beforeStrip),
+    malformedStrip + " | " + malformedPop);
+
+  events.push({ type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: exactUsage } }, time: settleTime });
+  let strip = groupTextsOf(render(env, props));
+  let pop = popTextOf(render(env, props));
+  const exactCost = (5 * flashMiss(settleTime) + 10 * flashOut(settleTime)) / 1e6;
+  check("usage hand-off: exact usage clears every residual estimate while /live is stale-open",
+    /本轮 输入 5 输出 10\b/.test(pop) && pop.indexOf("含估算 ¥0.000000") !== -1 &&
+      Math.abs(cnyOf(strip) - exactCost) < 0.0001,
+    strip + " | " + pop);
+  check("request route prices the usage chunk before message source arrives",
+    exactCost > 0 && cnyOf(strip) > 0, strip);
+
+  events.push({ type: "assistant/message", data: { turn: 1, step: 1, usage: exactUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: settleTime + 1 });
+  strip = groupTextsOf(render(env, props));
+  pop = popTextOf(render(env, props));
+  check("usage hand-off: duplicate message sample replaces rather than double-counts",
+    /本轮 输入 5 输出 10\b/.test(pop) && Math.abs(cnyOf(strip) - exactCost) < 0.0001,
+    strip + " | " + pop);
+  const modelUsage = env.states[22].current.byModel.get("deepseek-v4-flash").usage;
+  check("usage replacement: reasoning subset is replaced with the same step sample",
+    modelUsage.reasoningTokens === 2 && modelUsage.outputTokens === 10,
+    JSON.stringify(modelUsage));
+}
+
+// Scenario 42: batch authority is tracked independently for reasoning, text
+// and tool streams. A late batch rolls back its own earlier sampled deltas;
+// a batch in one kind must not suppress fallback deltas in another kind.
+{
+  const estimatedOutput = (tail) => {
+    const t0 = Date.now() - 1000;
+    const events = [
+      { type: "turn/start", data: { turn: 1 }, time: t0 },
+      { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+      ...tail,
+    ];
+    applyWith({ binding: () => ({ session: { events } }) });
+    const env = makeEnv();
+    seedLive(env, {
+      completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+      rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+      seedLength: 0
+    });
+    env.states[HOOK.hovered] = { value: true };
+    env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+    const props = {
+      useProjection: (key) => (key === "tokenUsage"
+        ? { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 }
+        : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }),
+      useSessions: () => ({ byId: { "session-test": { running: true } } }),
+      sessionId: "session-test",
+    };
+    const pop = popTextOf(render(env, props));
+    const match = pop.match(/本轮 输入 0 输出 (\d+)\b/);
+    return { value: match === null ? NaN : Number(match[1]), pop };
+  };
+
+  const batches = [
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["rrrr"] }, time: Date.now() - 500 },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: ["tttt"] }, time: Date.now() - 400 },
+    { type: "tool-call-chunks", data: { turn: 1, step: 1, args: ["aaaa"] }, time: Date.now() - 300 },
+  ];
+  const batchOnly = estimatedOutput(batches);
+  const deltaThenBatch = estimatedOutput([
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "reasoning-delta", text: "zzzz" } }, time: Date.now() - 800 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "zzzz" } }, time: Date.now() - 700 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "tool-call-delta", argumentsDelta: "zzzz" } }, time: Date.now() - 600 },
+    ...batches,
+  ]);
+  check("batch state: delta→batch rolls back provisional reasoning/text/tool",
+    Number.isFinite(batchOnly.value) && deltaThenBatch.value === batchOnly.value,
+    "batch=" + batchOnly.value + " delta→batch=" + deltaThenBatch.value + " | " + deltaThenBatch.pop);
+
+  const crossKind = estimatedOutput([
+    { type: "reasoning-chunks", data: { turn: 1, step: 1, texts: ["rrrr"] }, time: Date.now() - 600 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "tttt" } }, time: Date.now() - 500 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "tool-call-delta", argumentsDelta: "aaaa" } }, time: Date.now() - 400 },
+  ]);
+  check("batch state: a reasoning batch does not suppress text/tool deltas",
+    crossKind.value === batchOnly.value, "batch=" + batchOnly.value + " cross-kind=" + crossKind.value + " | " + crossKind.pop);
+
+  const toolDelta = estimatedOutput([
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "tool-call-delta", name: "read", argumentsDelta: "{\"path\":1}" } }, time: Date.now() - 400 },
+  ]);
+  check("tool-call-delta contributes a finite non-zero fallback estimate",
+    Number.isFinite(toolDelta.value) && toolDelta.value > 0, toolDelta.pop);
+}
+
+// Scenario 43: malformed usage never enters exact accounting or poisons the
+// throughput display. It also must not erase a still-valid stream estimate.
+{
+  const t0 = Date.now() - 3000;
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "request/context", data: { turn: 1, step: 1, model: "deepseek-v4-flash" }, time: t0 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "x".repeat(100) } }, time: t0 + 1000 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1, outputTokens: Infinity, reasoningTokens: 0 } } }, time: t0 + 1500 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: -1, outputTokens: 10, reasoningTokens: 0 } } }, time: t0 + 1600 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1, outputTokens: 2.5, reasoningTokens: 0 } } }, time: t0 + 1700 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 1, outputTokens: 10, reasoningTokens: 11 } } }, time: t0 + 1800 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 1, decodeTokens: Infinity },
+    openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 4, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage"
+      ? { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 }
+      : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: Infinity, decodeTokens: Infinity }),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const pop = popTextOf(render(env, props));
+  check("strict usage: non-finite/negative/fractional/subset-invalid samples are ignored",
+    /本轮 输入 0 输出 40\b/.test(pop), pop);
+  check("finite rate: malformed usage and host stats never render Infinity/NaN",
+    pop.indexOf("Infinity") === -1 && pop.indexOf("NaN") === -1, pop);
+}
+
+// Scenario 44: a complete spliced child turn, including turn/end, must not
+// terminate the parent's in-flight turn or hijack its active route.
+{
+  const t0 = Date.now() - 3000;
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "request/context", data: { turn: 1, step: 1, model: "deepseek-v4-flash" }, time: t0 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "parent" } }, time: t0 + 300 },
+    { type: "turn/start", data: { turn: 7 }, time: t0 + 500 },
+    { type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 + 550 },
+    { type: "text-chunks", data: { texts: ["child-only"] }, time: t0 + 575 },
+    { type: "step/start", data: { turn: 7, step: 1 }, time: t0 + 600 },
+    { type: "assistant/message", data: { turn: 7, step: 1, usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 }, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 900 },
+    { type: "step/end", data: { turn: 7, step: 1 }, time: t0 + 1000 },
+    { type: "turn/end", data: { turn: 7 }, time: t0 + 1100 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: { inputTokens: 5, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 2 } } }, time: t0 + 2000 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => (key === "tokenUsage"
+      ? { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 }
+      : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 }),
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  };
+  const pop = popTextOf(render(env, props));
+  check("spliced child turn/end leaves the parent turn active for its later usage",
+    /本轮 输入 5 输出 10\b/.test(pop) && pop.indexOf("本轮 1 轮") !== -1, pop);
+check("spliced child message does not hijack the parent's request route",
+    pop.indexOf("v4-flash 花费 ¥") !== -1 && pop.indexOf("v4-pro 花费 ¥") === -1, pop);
+}
+
+// Scenario 45: revision freshness is independent of the numeric amount. A
+// newer /live root may be smaller than /cost; descendants are added once and
+// root accounting flags must come from the same selected revision.
+{
+  applyWith({});
+  const env = makeEnv();
+  const rootUsage = { uncachedInputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2, reasoningTokens: 0 };
+  const descUsage = { uncachedInputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 3, reasoningTokens: 0 };
+  const pricing = { source: "official", version: 0, tables: HOST_TABLES, ledger: [] };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.2, rootUsage, models: [{ model: "deepseek-v4-flash", usage: rootUsage, costCny: 0.2 }],
+    eventRevision: 11, seedLength: 0, unpricedSteps: 1, invalidSteps: 0, pricing, budget: null
+  });
+  seedCost(env, {
+    merged: { uncachedInputTokens: 1020, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 103, reasoningTokens: 0 },
+    costCny: 0.6,
+    root: { usage: { uncachedInputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 100, reasoningTokens: 0 }, costCny: 0.5, models: [], unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { usage: descUsage, costCny: 0.1, models: [{ model: "deepseek-v4-pro", usage: descUsage, costCny: 0.1 }], unpricedSteps: 2, invalidSteps: 0 },
+    models: [], unpricedSteps: 2, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 1, rootEventRevision: 10, eventRevision: 12, pricingVersion: 0, pricing, stale: false
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const el = render(env, propsWithData);
+  const strip = groupTextsOf(el);
+  const pop = popTextOf(el);
+  check("revision merge: newer smaller live root wins and descendant cost is added once",
+    strip.indexOf("会话 ¥0.3000") !== -1, strip);
+  check("revision merge: token/model tail comes from the same root + descendants",
+    pop.indexOf("会话 输入 30 输出 5") !== -1 &&
+      pop.indexOf("v4-flash 花费 ¥0.200000") !== -1 && pop.indexOf("v4-pro 花费 ¥0.100000") !== -1,
+    pop);
+  check("revision merge: accounting flags follow the selected live root",
+    pop.indexOf("含 3 步未定价") !== -1, pop);
+}
+
+// Scenario 46: equal revisions are corrected by the host even when the legal
+// corrected value is zero. Without revisions, the legacy stale-zero heuristic
+// remains in effect (covered by Scenario 38).
+{
+  const t0 = Date.now() - 1000;
+  const usage46 = { inputTokens: 100, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "usage", usage: usage46 } }, time: t0 + 500 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: usage46, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 500 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  seedLive(env, {
+    completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, rootUsage: zero, models: [], eventRevision: events.length,
+    seedLength: 0, unpricedSteps: 0, invalidSteps: 0,
+    pricing: { source: "official", version: 0, tables: HOST_TABLES, ledger: [] }, budget: null
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  };
+  const el = render(env, props);
+  const strip = groupTextsOf(el);
+  const pop = popTextOf(el);
+  check("revision tie: host legal zero corrects a non-zero client fold",
+    /本轮 ¥0\.\d+ · 会话 ¥0\.0000/.test(strip), strip);
+  check("revision tie: host usage corrects session tokens down to zero",
+    pop.indexOf("会话 输入 0 输出 0") !== -1, pop);
+}
+
+// Scenario 47: a pricing-version change reprices already-settled samples at
+// their event time instead of leaving the client fold on the bootstrap table.
+{
+  const t0 = Date.now() - 1000;
+  const usage47 = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: usage47, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 500 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  const oldPricing = { source: "official", version: 0, tables: HOST_TABLES, ledger: [] };
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 0, pricing: oldPricing, budget: null });
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? TOKEN_USAGE : SESSION_STATS,
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  };
+  const before = cnyOf(groupTextsOf(render(env, props)));
+  const cheapTables = {
+    "deepseek-v4-flash": { miss: 1, read: 1, out: 1, missPeak: 1, readPeak: 1, outPeak: 1 },
+    "deepseek-v4-pro": { miss: 1, read: 1, out: 1, missPeak: 1, readPeak: 1, outPeak: 1 }
+  };
+  env.states[HOOK.live].value.pricing = { source: "official", version: 1, tables: cheapTables,
+    ledger: [{ effectiveAt: 0, version: 1, tables: cheapTables }] };
+  const after = cnyOf(groupTextsOf(render(env, props)));
+  check("pricing refresh: settled client samples are repriced exactly once",
+    before > after && Math.abs(after - 0.0011) < 0.00005, "before=" + before + " after=" + after);
+}
+
+// Scenario 48: the fork seed boundary applies to timing, tokens and model
+// attribution too—not just the monetary total.
+{
+  const t0 = Date.now() - 5000;
+  const parentUsage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const childUsage = { inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/chunk", data: { turn: 1, step: 1, chunk: { type: "text-delta", text: "parent" } }, time: t0 + 500 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: parentUsage, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 + 2000 },
+    { type: "turn/start", data: { turn: 2 }, time: t0 + 2000 },
+    { type: "step/start", data: { turn: 2, step: 1 }, time: t0 + 2000 },
+    { type: "assistant/chunk", data: { turn: 2, step: 1, chunk: { type: "text-delta", text: "child" } }, time: t0 + 2500 },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: childUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 3000 },
+    { type: "step/end", data: { turn: 2, step: 1 }, time: t0 + 3000 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, seedLength: 6, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false, parentId: "parent" } } }),
+    sessionId: "session-test",
+  };
+  const pop = popTextOf(render(env, props));
+  check("fork seed: inherited turns/timing/tokens are excluded",
+    pop.indexOf("会话 1 轮 1 步") !== -1 && pop.indexOf("会话 LLM 1.0s") !== -1 &&
+      pop.indexOf("会话 输入 10 输出 10") !== -1, pop);
+  check("fork seed: inherited model rows are excluded",
+    pop.indexOf("v4-flash 花费 ¥") !== -1 && pop.indexOf("v4-pro 花费 ¥") === -1, pop);
+}
+
+// Scenario 49: local lineage fallback accepts only origin=subagent, is cycle
+// safe, and a partial snapshot with zero named failures still shows 部分.
+{
+  applyWith({});
+  const env = makeEnv();
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const props = {
+    ...propsWithData,
+    useSessions: () => ({ byId: {
+      "session-test": { running: false, parentId: "sub-1", origin: "subagent" },
+      "sub-1": { parentId: "session-test", origin: "subagent" },
+      "ordinary-fork": { parentId: "session-test", origin: "fork" },
+    } })
+  };
+  let pop = popTextOf(render(env, props));
+  check("lineage fallback: ordinary forks are excluded and cycles do not re-add root",
+    pop.indexOf("含 1 个子会话") !== -1, pop);
+
+  const env2 = makeEnv();
+  seedCost(env2, {
+    merged: TOKEN_USAGE, costCny: 0.5, root: { costCny: 0.5 }, descendants: { costCny: 0 }, models: [],
+    unpricedSteps: 0, invalidSteps: 0, partial: true, failedSessionCount: 0,
+    persistenceAvailable: true, descendantCount: 0, pricing: null, stale: false
+  });
+  env2.states[HOOK.hovered] = { value: true };
+  env2.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const el2 = render(env2, props);
+  pop = popTextOf(el2);
+  check("partial snapshot: partial=true is visible even when failedSessionCount is zero",
+    groupTextsOf(el2).indexOf("会话 ¥0.5000 部分") !== -1 && pop.indexOf("(部分)") !== -1 &&
+      pop.indexOf("含 1 个子会话") !== -1,
+    groupTextsOf(el2) + " | " + pop);
+}
+
+// Scenario 50: malformed turn/step coordinates cannot manufacture timing or
+// completed-step counts in the client fallback while the host poll catches up.
+{
+  const t0 = Date.now() - 2000;
+  const events = [
+    { type: "turn/start", data: { turn: -1 }, time: t0 },
+    { type: "step/start", data: { turn: -1, step: 1 }, time: t0 },
+    { type: "assistant/chunk", data: { turn: -1, step: 1, chunk: { type: "text-delta", text: "bad" } }, time: t0 + 500 },
+    { type: "assistant/message", data: { turn: -1, step: 1, usage: { inputTokens: 1, outputTokens: 1 }, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: -1, step: 1 }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: "2", step: "1" }, time: t0 + 1500 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 2, seedLength: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  }));
+  check("strict stats: malformed turn/step ids do not enter fallback counts or timing",
+    pop.indexOf("会话 0 轮 0 步") !== -1 && pop.indexOf("会话 LLM 0.0s") !== -1, pop);
+}
+
+// Scenario 51: old /cost responses did not carry descendantCount. Their
+// missing field must not erase the client-side lineage count (legal 0 still can).
+{
+  applyWith({});
+  const env = makeEnv();
+  seedCost(env, {
+    merged: { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+    costCny: 0, root: { costCny: 0 }, descendants: { costCny: 0 }, models: [],
+    unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    persistenceAvailable: false, pricing: null, stale: false
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: {
+      "session-test": { running: false },
+      "sub-legacy": { parentId: "session-test", origin: "subagent" },
+    } }),
+    sessionId: "session-test",
+  }));
+  check("legacy cost: missing descendantCount preserves the local subagent count",
+    pop.indexOf("含 1 个子会话") !== -1, pop);
+}
+
+// Scenario 52: a present legacy session header with no seedLength is an
+// explicit no-seed session, even when it has a parent link.
+{
+  const t0 = Date.now() - 1500;
+  const ownUsage = { inputTokens: 10, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: ownUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+  ];
+  applyWith({ binding: () => ({ session: { events, header: { origin: "subagent", parentSession: "parent" } } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const pop = popTextOf(render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false, parentId: "parent", origin: "subagent" } } }),
+    sessionId: "session-test",
+  }));
+  check("legacy seed: a missing seedLength header folds the whole child session",
+    pop.indexOf("会话 输入 10 输出 10") !== -1 && pop.indexOf("v4-flash 花费 ¥") !== -1, pop);
+}
+
+// Scenario 53: if an old host initially omits seedLength, a later authoritative
+// /live boundary rewinds and rebuilds every child-only aggregate.
+{
+  const t0 = Date.now() - 4000;
+  const parentUsage = { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const childUsage = { inputTokens: 8, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0 };
+  const events = [
+    { type: "request/context", data: { model: "deepseek-v4-pro" }, time: t0 },
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage: parentUsage, message: { source: { model: "deepseek-v4-pro" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { type: "request/context", data: { model: "deepseek-v4-flash" }, time: t0 + 2000 },
+    { type: "turn/start", data: { turn: 2 }, time: t0 + 2000 },
+    { type: "step/start", data: { turn: 2, step: 1 }, time: t0 + 2000 },
+    { type: "assistant/message", data: { turn: 2, step: 1, usage: childUsage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 3000 },
+    { type: "step/end", data: { turn: 2, step: 1 }, time: t0 + 3000 },
+  ];
+  const seed = 5;
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const props = {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false, parentId: "parent" } } }),
+    sessionId: "session-test",
+  };
+  let pop = popTextOf(render(env, props));
+  check("late seed: unknown boundary never exposes inherited parent totals",
+    pop.indexOf("会话 输入 0 输出 0") !== -1 && pop.indexOf("v4-pro 花费 ¥") === -1, pop);
+  env.states[HOOK.live].value = { ...env.states[HOOK.live].value, seedLength: seed };
+  pop = popTextOf(render(env, props));
+  check("late seed: arriving boundary rebuilds child timing/tokens/model only",
+    pop.indexOf("会话 1 轮 1 步") !== -1 && pop.indexOf("会话 输入 8 输出 4") !== -1 &&
+      pop.indexOf("v4-flash 花费 ¥") !== -1 && pop.indexOf("v4-pro 花费 ¥") === -1, pop);
+}
+
+// Scenario 54: a newer live root must not be spliced onto descendants priced
+// with a different ledger version; use the coherent /cost snapshot as a unit.
+{
+  applyWith({});
+  const env = makeEnv();
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const rootOld = { uncachedInputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const descOld = { uncachedInputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2, reasoningTokens: 0 };
+  seedCost(env, {
+    merged: { uncachedInputTokens: 120, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 12, reasoningTokens: 0 }, costCny: 0.6,
+    root: { usage: rootOld, costCny: 0.5, models: [{ model: "deepseek-v4-pro", usage: rootOld, costCny: 0.5 }], unpricedSteps: 0, invalidSteps: 0 },
+    descendants: { usage: descOld, costCny: 0.1, models: [{ model: "deepseek-v4-flash", usage: descOld, costCny: 0.1 }], unpricedSteps: 0, invalidSteps: 0 },
+    models: [], unpricedSteps: 0, invalidSteps: 0, partial: false, failedSessionCount: 0,
+    descendantCount: 1, rootEventRevision: 10, pricingVersion: 0,
+    pricing: { source: "official", version: 0, tables: HOST_TABLES, ledger: [] }, stale: false
+  });
+  seedLive(env, { completed: null, openStepStart: null, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0.2, rootUsage: zero, models: [], eventRevision: 11, seedLength: 0,
+    unpricedSteps: 0, invalidSteps: 0,
+    pricing: { source: "official", version: 1, tables: HOST_TABLES, ledger: [] }, budget: null });
+  const el = render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: false } } }),
+    sessionId: "session-test",
+  });
+  check("revision merge: mismatched pricing versions never splice live root + old descendants",
+    groupTextsOf(el).indexOf("会话 ¥0.6000") !== -1, groupTextsOf(el));
+}
+
+// Scenario 55: an unknown request route is unpriced, not absent. Its
+// provisional tokens must feed the same Tok totals as a known-model estimate
+// so settling real usage does not make the session total jump upward.
+{
+  const t0 = Date.now() - 1000;
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "text-chunks", data: { turn: 1, step: 1, texts: ["x".repeat(250)] }, time: t0 + 500 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const zero = { uncachedInputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+  const el = render(env, {
+    useProjection: (key) => key === "tokenUsage" ? zero : { turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+    useSessions: () => ({ byId: { "session-test": { running: true } } }),
+    sessionId: "session-test",
+  });
+  const pop = popTextOf(el);
+  check("unknown estimate: 本轮 and 会话 Tok share the provisional output",
+    /本轮 输入 0 输出 100\b/.test(pop) && /会话 输入 0 输出 100\b/.test(pop), pop);
+  check("unknown estimate: the existing model group attributes tokens as unpriced",
+    pop.indexOf("unknown 未计价") !== -1 && groupTextsOf(el).indexOf("输入 0 · 输出 100") !== -1,
+    groupTextsOf(el) + " | " + pop);
+}
+
+// Scenario 56: provisional next-step input/cache must use the same live gate
+// as output. If a run stops abnormally without end events, the last smoothed
+// carry must disappear instead of becoming a permanent session total.
+{
+  const t0 = Date.now() - 3000;
+  const usage = { inputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const events = [
+    { type: "turn/start", data: { turn: 1 }, time: t0 },
+    { type: "step/start", data: { turn: 1, step: 1 }, time: t0 },
+    { type: "assistant/message", data: { turn: 1, step: 1, usage, message: { source: { model: "deepseek-v4-flash" } } }, time: t0 + 1000 },
+    { type: "step/end", data: { turn: 1, step: 1 }, time: t0 + 1000 },
+    { type: "step/start", data: { turn: 1, step: 2 }, time: t0 + 2000 },
+  ];
+  applyWith({ binding: () => ({ session: { events } }) });
+  const env = makeEnv();
+  seedLive(env, {
+    completed: null, openStepStart: t0 + 2000, pendingMin: null, toolPhaseStart: null,
+    rootCostCny: 0, unpricedSteps: 0, invalidSteps: 0, pricing: null, budget: null,
+    seedLength: 0
+  });
+  env.states[HOOK.hovered] = { value: true };
+  env.states[HOOK.anchor] = { value: { left: 100, top: 100 } };
+  const projection = { uncachedInputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, reasoningTokens: 0 };
+  const zeroStats = { turns: 1, steps: 1, llmMs: 1000, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 };
+  const makeProps = (running) => ({
+    useProjection: (key) => key === "tokenUsage" ? projection : zeroStats,
+    useSessions: () => ({ byId: { "session-test": { running } } }),
+    sessionId: "session-test",
+  });
+  const livePop = popTextOf(render(env, makeProps(true)));
+  check("estimate gate: live next step exposes provisional input carry",
+    /本轮 输入 145 输出 10\b/.test(livePop), livePop);
+  const stoppedPop = popTextOf(render(env, makeProps(false)));
+  check("estimate gate: abnormal stop clears provisional input/cache without end events",
+    /本轮 输入 100 输出 10\b/.test(stoppedPop) && /会话 输入 100 输出 10\b/.test(stoppedPop) &&
+      stoppedPop.indexOf("输入 145") === -1,
+    stoppedPop);
+}
+
+// Scenario 57: an incomplete /today fold is a lower bound. It must neither
+// vote in the ETA EWMA nor reduce a same-day complete budget snapshot.
+{
+  // Flush effects created by preceding synchronous harness scenarios before
+  // installing this scenario's isolated fetch/storage pair.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const storage = {};
+  globalThis.localStorage = {
+    getItem: (k) => (k in storage ? storage[k] : null),
+    setItem: (k, v) => { storage[k] = String(v); },
+    removeItem: (k) => { delete storage[k]; },
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url) => {
+    if (String(url).indexOf("/plugins/better-stats/today") !== -1) {
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({
+        date: "2026-08-22", costCny: 5, monthCostCny: 20,
+        unpricedSteps: 0, invalidSteps: 0, sessionCount: 1,
+        partial: true, failedSessionCount: 1, stale: false,
+        queriedAt: "2026-08-22T01:00:00.000Z",
+        budget: { daily: 100, monthly: 1000 }
+      }) });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(defaultBody(url)) });
+  };
+  try {
+    applyWith({});
+    const env = makeEnv();
+    seedToday(env, {
+      date: "2026-08-22", costCny: 10, monthCostCny: 30,
+      unpricedSteps: 0, invalidSteps: 0, sessionCount: 2, at: Date.now()
+    });
+    render(env, propsWithData);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const kept = env.states[HOOK.today].value;
+    check("partial today: same-day complete budget value never moves down",
+      kept !== null && kept.costCny === 10 && kept.monthCostCny === 30,
+      JSON.stringify(kept));
+    check("partial today: incomplete lower bound is not persisted as an ETA sample",
+      storage["dsh-better-stats:eta"] === void 0,
+      storage["dsh-better-stats:eta"]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+console.log(failures === 0 ? "\nALL CHECKS PASSED" : "\n" + failures + " CHECK(S) FAILED");
+process.exit(failures === 0 ? 0 : 1);
